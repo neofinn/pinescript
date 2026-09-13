@@ -2,7 +2,7 @@
 // =====================================================================
 // MULTI-STRATEGY CONFIRMATION SYSTEM
 //
-// Six reads of the same chart, each switchable, and a trade only when
+// Seven reads of the same chart, each switchable, and a trade only when
 // enough INDEPENDENT ones agree:
 //
 //   STRUCTURE family
@@ -72,7 +72,7 @@
 // how a confirmation system quietly becomes a single-signal system with
 // extra steps.
 //
-// ALL SIX ARE EVENTS
+// ALL SEVEN ARE EVENTS
 // Each is true on the bar the thing happens and false afterwards, so a
 // vote count is a count of things that OCCURRED. An earlier version
 // carried a trend-following slot (Supertrend, then DI/ADX) and it was a
