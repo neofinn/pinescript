@@ -353,6 +353,65 @@ obShort = not na(obLevelShort)
 fvLong  = not na(fvLevelLong)
 fvShort = not na(fvLevelShort)
 
+// ------------------------------------------------- contribution counters
+// "Did this strategy do anything?" is a question the chart should answer
+// rather than one you discover by toggling a switch and squinting at a
+// P&L number. FIRED counts the bars a strategy triggered on. SOLO counts
+// the bars where it was the ONLY one in its family to trigger — the only
+// bars on which it can have changed a decision at all, since a family
+// casts one vote however many of its members agree.
+//
+// A strategy with a healthy FIRED and SOLO of zero is fully subsumed by
+// its family-mates: it costs nothing and contributes nothing. Measured on
+// 269 real daily bars, CHoCH did exactly that — it fired three times and
+// a 20-bar range breakout fired on all three of those bars, because a
+// swing low usually IS the recent range low.
+brkFired   = brkLong   or brkShort
+bosFired   = bosLong   or bosShort
+chochFired = chochLong or chochShort
+srFired    = srLong    or srShort
+sweepFired = sweepLong or sweepShort
+obFired    = obLong    or obShort
+fvFired    = fvLong    or fvShort
+
+var int nBrk = 0
+var int nBos = 0
+var int nChoch = 0
+var int nSr = 0
+var int nSweep = 0
+var int nOb = 0
+var int nFv = 0
+var int sBrk = 0
+var int sBos = 0
+var int sChoch = 0
+var int sSr = 0
+var int sSweep = 0
+var int sOb = 0
+var int sFv = 0
+
+if barstate.isconfirmed
+    if brkFired
+        nBrk += 1
+        sBrk += bosFired or chochFired ? 0 : 1
+    if bosFired
+        nBos += 1
+        sBos += brkFired or chochFired ? 0 : 1
+    if chochFired
+        nChoch += 1
+        sChoch += brkFired or bosFired ? 0 : 1
+    if srFired
+        nSr += 1
+        sSr += sweepFired ? 0 : 1
+    if sweepFired
+        nSweep += 1
+        sSweep += srFired ? 0 : 1
+    if obFired
+        nOb += 1
+        sOb += fvFired ? 0 : 1
+    if fvFired
+        nFv += 1
+        sFv += obFired ? 0 : 1
+
 // ---------------------------------------------------- displacement gate
 // Applies to the STRUCTURE family only. An institutional break leaves a
 // body; a drift across the line is the false-break signature.
@@ -533,21 +592,37 @@ voteCell(table t, int r, string name, bool l, bool s, bool on) =>
     table.cell(t, 1, r, not on ? "off" : l ? "LONG" : s ? "SHORT" : "-", text_size=size.tiny,
          text_color=not on ? color.new(color.gray, 65) : l ? color.teal : s ? color.maroon : color.gray)
 
-var table votes = table.new(position.top_right, 2, 12, border_width=1)
+// A solo count of zero is the interesting case: the strategy fired but
+// never alone in its family, so it never changed a vote. Coloured rather
+// than left to be spotted.
+statCell(table t, int r, int fired, int solo, bool on) =>
+    txt = not on ? "" : str.tostring(fired) + " / " + str.tostring(solo)
+    col = not on ? color.new(color.gray, 65) : solo == 0 and fired > 0 ? color.orange : color.gray
+    table.cell(t, 2, r, txt, text_size=size.tiny, text_color=col)
+
+var table votes = table.new(position.top_right, 3, 12, border_width=1)
 if barstate.islast
     table.cell(votes, 0, 0, "Family / strategy", text_size=size.tiny, text_color=color.white)
     table.cell(votes, 1, 0, str.tostring(longVotes) + "L / " + str.tostring(shortVotes) + "S",
          text_size=size.tiny, text_color=color.white)
+    table.cell(votes, 2, 0, "fired/solo", text_size=size.tiny, text_color=color.white)
     voteCell(votes, 1, "STRUCTURE", structLong, structShort, useBreakout or useBos or useChoch)
     voteCell(votes, 2, "  range breakout", brkLong, brkShort, useBreakout)
+    statCell(votes, 2, nBrk, sBrk, useBreakout)
     voteCell(votes, 3, "  BOS", bosLong, bosShort, useBos)
+    statCell(votes, 3, nBos, sBos, useBos)
     voteCell(votes, 4, "  CHoCH", chochLong, chochShort, useChoch)
+    statCell(votes, 4, nChoch, sChoch, useChoch)
     voteCell(votes, 5, "REJECTION", rejLong, rejShort, useSR or useSweep)
     voteCell(votes, 6, "  S/R pushback", srLong, srShort, useSR)
+    statCell(votes, 6, nSr, sSr, useSR)
     voteCell(votes, 7, "  liquidity sweep", sweepLong, sweepShort, useSweep)
+    statCell(votes, 7, nSweep, sSweep, useSweep)
     voteCell(votes, 8, "ZONE", zoneLong, zoneShort, useZones or useFvg)
     voteCell(votes, 9, "  order block", obLong, obShort, useZones)
+    statCell(votes, 9, nOb, sOb, useZones)
     voteCell(votes, 10, "  fair value gap", fvLong, fvShort, useFvg)
+    statCell(votes, 10, nFv, sFv, useFvg)
     table.cell(votes, 0, 11, "Need", text_size=size.tiny, text_color=color.gray)
     table.cell(votes, 1, 11, str.tostring(minConfirmations) + (capFamilies ? " of 3 families" : " uncapped") +
          (useTrailing or takeProfitR > 0 ? "" : "  NO EXIT"),
