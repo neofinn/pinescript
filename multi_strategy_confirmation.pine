@@ -152,6 +152,22 @@
 // FIRED/SOLO columns exist so the next redundant idea is visible in one
 // glance instead of one A/B test.
 //
+// WHAT MEASUREMENT SAYS ABOUT THE ZONE FAMILY
+// The Python port of this script (scripts/backtest_port.py) was run over
+// 1,513 real GC=F 45m bars and every trade's level was attributed to the
+// strategy that supplied it. Order blocks and fair value gaps supplied ALL
+// of them, because zones sit first in the level priority, and they were
+// where the losses were:
+//
+//   baseline, both zones            19 trades   -4.40R   PF 0.60
+//   baseline, order blocks banned   20 trades   -1.65R   PF 0.83
+//   baseline, both zones banned     19 trades   +1.43R   PF 1.18
+//   filtered, order blocks banned    8 trades   +1.96R   PF 1.98
+//
+// Order blocks were the worst source under every configuration tested, so
+// `useZones` off is the measured setting. It is a switch rather than a
+// deletion because eight trades is not enough to delete code over.
+//
 // ON "PROPHECY"-STYLE OUTPUT
 // The commercial indicator of that name advertises live bias, entry, stop,
 // TP1/TP2/TP3, breakeven and trailing, and attributes it to orderflow. It
@@ -291,6 +307,12 @@ atrLen = input.int(14, "ATR length", minval=1, group=grpR)
 stopAtrMult = input.float(1.5, "Initial stop beyond level (x ATR)", minval=0.1, step=0.1, group=grpR)
 breakevenR = input.float(1.0, "Lock breakeven at (R multiple)", minval=0.1, step=0.1, group=grpR)
 useTrailing = input.bool(true, "Trail the stop after breakeven", group=grpR)
+trailUsePoints = input.bool(false, "Trail a fixed distance instead of an ATR multiple", group=grpR,
+     tooltip="ATR scales the trail with volatility, which is usually right. Fixed points is for when you have measured a distance that works on one instrument and want it held there regardless.")
+trailPoints = input.float(7.0, "Trail distance (price points)", minval=0.1, step=0.5, group=grpR,
+     tooltip="In quote units: 7 on gold is $7. For scale, the median ATR(14) on GC 45m is about 15 points, so 7 is roughly half an ATR — far tighter than the 2.5x ATR the tightness dial gives.")
+trailStepPoints = input.float(3.0, "Only move the stop when it improves by (points)", minval=0.0, step=0.5, group=grpR,
+     tooltip="Stops the stop creeping a tick at a time. 0 makes it ratchet on every improvement, which is the old behaviour.")
 trailTightness = input.int(2, "Trail tightness after breakeven (1 loose - 5 tight)", minval=1, maxval=5, group=grpR)
 takeProfitR = input.float(0.0, "Take profit at (R multiple, 0 = off)", minval=0.0, step=0.5, group=grpR,
      tooltip="Needed when the trail is off. With no trail AND no target the only exits are the initial stop and the breakeven stop, so every trade is a loss or a scratch and none can ever win.")
@@ -838,8 +860,13 @@ if strategy.position_size > 0
         beLocked := true
         stopLevel := entryPrice
     if beLocked and atrOk and useTrailing
-        // Trail only ratchets up. A stop that can loosen is not a stop.
-        stopLevel := math.max(nz(stopLevel, entryPrice), runExtreme - trailAtrMult * atr)
+        // Trail only ratchets up. A stop that can loosen is not a stop, so
+        // the candidate has to BEAT the current stop by the step before it
+        // is taken. A step of 0 reduces this to a plain ratchet.
+        trailDist = trailUsePoints ? trailPoints : trailAtrMult * atr
+        cand = runExtreme - trailDist
+        if cand >= nz(stopLevel, entryPrice) + trailStepPoints
+            stopLevel := cand
     tpLong = takeProfitR > 0 and not na(entryR) ? entryPrice + takeProfitR * entryR : na
     if not na(stopLevel)
         if not useScaledExit
@@ -858,7 +885,10 @@ if strategy.position_size < 0
         beLocked := true
         stopLevel := entryPrice
     if beLocked and atrOk and useTrailing
-        stopLevel := math.min(nz(stopLevel, entryPrice), runExtreme + trailAtrMult * atr)
+        trailDistS = trailUsePoints ? trailPoints : trailAtrMult * atr
+        candS = runExtreme + trailDistS
+        if candS <= nz(stopLevel, entryPrice) - trailStepPoints
+            stopLevel := candS
     tpShort = takeProfitR > 0 and not na(entryR) ? entryPrice - takeProfitR * entryR : na
     if not na(stopLevel)
         if not useScaledExit
