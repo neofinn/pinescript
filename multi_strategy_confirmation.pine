@@ -2,19 +2,21 @@
 // =====================================================================
 // MULTI-STRATEGY CONFIRMATION SYSTEM
 //
-// Seven reads of the same chart, each switchable, and a trade only when
+// Six reads of the same chart, each switchable, and a trade only when
 // enough INDEPENDENT ones agree:
 //
 //   STRUCTURE family
 //     1. RANGE BREAKOUT   — close beyond an N-bar range
 //     2. BOS              — close beyond the last swing, WITH the bias
-//     3. CHoCH            — close beyond the last swing, AGAINST it
 //   REJECTION family
-//     4. S/R PUSHBACK     — rejection approaching a swing pivot
-//     5. LIQUIDITY SWEEP  — wick THROUGH a swing, close back inside
+//     3. S/R PUSHBACK     — rejection approaching a swing pivot
+//     4. LIQUIDITY SWEEP  — wick THROUGH a swing, close back inside
 //   ZONE family
-//     6. ORDER BLOCK      — rejection inside the base of an impulse
-//     7. FAIR VALUE GAP   — rejection inside a 3-bar imbalance
+//     5. ORDER BLOCK      — rejection inside the base of an impulse
+//     6. FAIR VALUE GAP   — rejection inside a 3-bar imbalance
+//
+//   Filters (no direction of their own, so they gate rather than vote):
+//     displacement, relative volume, session
 //
 // WHY FAMILIES, AND WHY THIS IS THE IMPORTANT PART
 // Most of these are computed from the same swing pivots. A range
@@ -31,7 +33,7 @@
 // how a confirmation system quietly becomes a single-signal system with
 // extra steps.
 //
-// ALL SEVEN ARE EVENTS
+// ALL SIX ARE EVENTS
 // Each is true on the bar the thing happens and false afterwards, so a
 // vote count is a count of things that OCCURRED. An earlier version
 // carried a trend-following slot (Supertrend, then DI/ADX) and it was a
@@ -75,10 +77,36 @@
 // worse. Treat a losing backtest as conclusive and a winning one as a
 // reason to go and measure the spread you actually pay.
 //
-// NOT INCLUDED, DELIBERATELY
-// No volume-based signal. XAUUSD from a spot CFD feed reports TICK count,
-// not traded size, so a "volume spike" there measures quote activity and
-// calling it institutional participation would be inventing a measurement.
+// VOLUME IS A FILTER, AND ON GOLD IT IS TICK VOLUME
+// Volume has no direction, so it cannot vote — it gates. `useVolume`
+// requires the signal bar to trade above `volMult` x its own recent
+// average.
+//
+// Read it for what it is. XAUUSD from a spot CFD feed reports TICK COUNT,
+// not contracts: it measures how often the price was requoted, not how
+// much was transacted. It tracks real futures volume well enough to be
+// useful as a participation proxy and badly enough that calling a spike
+// "institutional accumulation" would be a story, not a measurement. On a
+// futures symbol (GC1!) the same input is real traded size.
+//
+// WHY CHoCH WAS REMOVED
+// It fired and changed nothing. Ported to Python and run over 269 real
+// daily bars it triggered three times, and a 20-bar range breakout fired
+// on all three of those bars — so the structure vote was already cast and
+// toggling CHoCH could not alter a single decision. A swing low usually
+// IS the recent range low, which makes the two fire together. The
+// FIRED/SOLO columns exist so the next redundant idea is visible in one
+// glance instead of one A/B test.
+//
+// ON VERY HIGH WIN RATES
+// This system will not produce one, and a version that did would be worse.
+// Win rate and profit are close to independent: a 25% win rate at 10.9:1
+// and a 48% win rate at 3.3:1 were measured on this same instrument and
+// the 25% version made more money. Systems advertising 95%+ get there by
+// risking thirty to make one, which hides the loss rather than removing
+// it. For FEWER, BETTER trades set minConfirmations to 3 and switch on
+// displacement, volume and a session — that is selectivity, which is a
+// real thing, rather than a win rate, which is a ratio you can rig.
 // =====================================================================
 
 strategy("Multi-Strategy Confirmation",
@@ -106,6 +134,10 @@ grpF = "Filters"
 requireDisplacement = input.bool(false, "Structural breaks need displacement", group=grpF,
      tooltip="The breaking bar's body must exceed displacementAtr x ATR. Applies to the STRUCTURE family only — a rejection is not supposed to be violent.")
 displacementAtr = input.float(0.8, "Displacement body (x ATR)", minval=0.1, step=0.1, group=grpF)
+useVolume = input.bool(false, "Signal bar needs above-average volume", group=grpF,
+     tooltip="A participation filter, not a vote — volume has no direction. On spot XAUUSD this is TICK COUNT, not contracts: it measures requote frequency, a decent proxy for activity and not a measurement of size. On GC1! it is real traded volume.")
+volMult = input.float(1.5, "Volume vs its average (x)", minval=0.5, step=0.1, group=grpF)
+volLen = input.int(20, "Volume average length", minval=2, group=grpF)
 useSession = input.bool(false, "Trade only inside a session", group=grpF)
 sessionSpec = input.session("0700-1600", "Session (exchange time)", group=grpF,
      tooltip="London plus the New York overlap in UTC terms. Check your chart's timezone — this is evaluated in exchange time, not yours.")
@@ -123,27 +155,23 @@ grp2 = "2. BOS - break of structure (structure)"
 useBos = input.bool(true, "Enabled", group=grp2,
      tooltip="Close beyond the last swing in the direction the structure is already going. Continuation.")
 
-grp3 = "3. CHoCH - change of character (structure)"
-useChoch = input.bool(true, "Enabled", group=grp3,
-     tooltip="Close beyond the last swing AGAINST the prevailing structure — the first break that says the trend may be over. Reversal.")
+grp3 = "3. S/R pushback (rejection)"
+useSR = input.bool(true, "Enabled", group=grp3)
+srTolAtr = input.float(0.5, "Touch tolerance (x ATR)", minval=0.05, step=0.05, group=grp3)
 
-grp4 = "4. S/R pushback (rejection)"
-useSR = input.bool(true, "Enabled", group=grp4)
-srTolAtr = input.float(0.5, "Touch tolerance (x ATR)", minval=0.05, step=0.05, group=grp4)
-
-grp5 = "5. Liquidity sweep (rejection)"
-useSweep = input.bool(true, "Enabled", group=grp5,
+grp4 = "4. Liquidity sweep (rejection)"
+useSweep = input.bool(true, "Enabled", group=grp4,
      tooltip="The wick trades THROUGH the swing and the close comes back inside — stops taken, price rejected. Stricter than a pushback, which only requires price to approach.")
 
-grp6 = "6. Order block (zone)"
-useZones = input.bool(true, "Enabled", group=grp6,
+grp5 = "5. Order block (zone)"
+useZones = input.bool(true, "Enabled", group=grp5,
      tooltip="The base an impulse departed from: when a bar's body exceeds impulseAtr x ATR, the bar BEFORE it becomes the zone.")
-impulseAtr = input.float(1.5, "Impulse body (x ATR)", minval=0.5, step=0.1, group=grp6)
+impulseAtr = input.float(1.5, "Impulse body (x ATR)", minval=0.5, step=0.1, group=grp5)
 
-grp7 = "7. Fair value gap (zone)"
-useFvg = input.bool(true, "Enabled", group=grp7,
+grp6 = "6. Fair value gap (zone)"
+useFvg = input.bool(true, "Enabled", group=grp6,
      tooltip="A three-bar imbalance: bar 1's high below bar 3's low leaves a range price traded through without trading in. Entry is the return to it.")
-fvgMinAtr = input.float(0.25, "Minimum gap size (x ATR)", minval=0.0, step=0.05, group=grp7)
+fvgMinAtr = input.float(0.25, "Minimum gap size (x ATR)", minval=0.0, step=0.05, group=grp6)
 
 grpZ = "Zone handling (order blocks and FVGs)"
 zoneMaxAge = input.int(200, "Zone max age (bars)", minval=10, group=grpZ)
@@ -181,6 +209,12 @@ trailAtrMult = switch trailTightness
 
 inSession = not useSession or not na(time(timeframe.period, sessionSpec))
 
+// Volume gates; it never votes, because it has no direction. na volume on a
+// feed that does not report it must not silently pass the filter, so an
+// absent series fails the test rather than being treated as sufficient.
+volAvg = ta.sma(volume, volLen)
+volOk = not useVolume or (not na(volume) and not na(volAvg) and volAvg > 0 and volume > volMult * volAvg)
+
 // --------------------------------------------------------------- pivots
 // Already lagged by pivotRight when they arrive, so referencing them here
 // cannot see into the future.
@@ -213,31 +247,26 @@ var int bias = 0
 brokeHigh = not na(lastPH) and close > lastPH and (na(brokenHigh) or lastPH != brokenHigh)
 brokeLow  = not na(lastPL) and close < lastPL and (na(brokenLow)  or lastPL != brokenLow)
 
+// A break WITH the bias is a BOS. A break against it is a change of
+// character, which is not signalled here — but the bias still flips on it,
+// because that is what makes the NEXT break in the new direction a genuine
+// BOS rather than a counter-trend break wearing the name. Removing the
+// signal must not remove the bookkeeping.
 bosLong = false
 bosShort = false
-chochLong = false
-chochShort = false
 if brokeHigh
-    // With the bias already up this continues it; against a down bias it
-    // is the first break that says the down move may be finished.
     if bias >= 0
         bosLong := true
-    else
-        chochLong := true
     brokenHigh := lastPH
     bias := 1
 if brokeLow
     if bias <= 0
         bosShort := true
-    else
-        chochShort := true
     brokenLow := lastPL
     bias := -1
 
-bosLong    := useBos   and bosLong
-bosShort   := useBos   and bosShort
-chochLong  := useChoch and chochLong
-chochShort := useChoch and chochShort
+bosLong  := useBos and bosLong
+bosShort := useBos and bosShort
 
 // ------------------------------------------- REJECTION 4. S/R pushback
 srTol = atrOk ? srTolAtr * atr : na
@@ -368,7 +397,6 @@ fvShort = not na(fvLevelShort)
 // swing low usually IS the recent range low.
 brkFired   = brkLong   or brkShort
 bosFired   = bosLong   or bosShort
-chochFired = chochLong or chochShort
 srFired    = srLong    or srShort
 sweepFired = sweepLong or sweepShort
 obFired    = obLong    or obShort
@@ -376,14 +404,12 @@ fvFired    = fvLong    or fvShort
 
 var int nBrk = 0
 var int nBos = 0
-var int nChoch = 0
 var int nSr = 0
 var int nSweep = 0
 var int nOb = 0
 var int nFv = 0
 var int sBrk = 0
 var int sBos = 0
-var int sChoch = 0
 var int sSr = 0
 var int sSweep = 0
 var int sOb = 0
@@ -392,13 +418,10 @@ var int sFv = 0
 if barstate.isconfirmed
     if brkFired
         nBrk += 1
-        sBrk += bosFired or chochFired ? 0 : 1
+        sBrk += bosFired ? 0 : 1
     if bosFired
         nBos += 1
-        sBos += brkFired or chochFired ? 0 : 1
-    if chochFired
-        nChoch += 1
-        sChoch += brkFired or bosFired ? 0 : 1
+        sBos += brkFired ? 0 : 1
     if srFired
         nSr += 1
         sSr += sweepFired ? 0 : 1
@@ -416,8 +439,8 @@ if barstate.isconfirmed
 // Applies to the STRUCTURE family only. An institutional break leaves a
 // body; a drift across the line is the false-break signature.
 displaced = not requireDisplacement or (atrOk and body > displacementAtr * atr)
-structLong  = (brkLong  or bosLong  or chochLong)  and displaced
-structShort = (brkShort or bosShort or chochShort) and displaced
+structLong  = (brkLong  or bosLong)  and displaced
+structShort = (brkShort or bosShort) and displaced
 rejLong   = srLong  or sweepLong
 rejShort  = srShort or sweepShort
 zoneLong  = obLong  or fvLong
@@ -430,13 +453,13 @@ zoneShort = obShort or fvShort
 // the more of them you enable.
 longVotesCapped  = (structLong  ? 1 : 0) + (rejLong  ? 1 : 0) + (zoneLong  ? 1 : 0)
 shortVotesCapped = (structShort ? 1 : 0) + (rejShort ? 1 : 0) + (zoneShort ? 1 : 0)
-longVotesRaw  = (brkLong  ? 1 : 0) + (bosLong  ? 1 : 0) + (chochLong  ? 1 : 0) + (srLong  ? 1 : 0) + (sweepLong  ? 1 : 0) + (obLong  ? 1 : 0) + (fvLong  ? 1 : 0)
-shortVotesRaw = (brkShort ? 1 : 0) + (bosShort ? 1 : 0) + (chochShort ? 1 : 0) + (srShort ? 1 : 0) + (sweepShort ? 1 : 0) + (obShort ? 1 : 0) + (fvShort ? 1 : 0)
+longVotesRaw  = (brkLong  ? 1 : 0) + (bosLong  ? 1 : 0) + (srLong  ? 1 : 0) + (sweepLong  ? 1 : 0) + (obLong  ? 1 : 0) + (fvLong  ? 1 : 0)
+shortVotesRaw = (brkShort ? 1 : 0) + (bosShort ? 1 : 0) + (srShort ? 1 : 0) + (sweepShort ? 1 : 0) + (obShort ? 1 : 0) + (fvShort ? 1 : 0)
 longVotes  = capFamilies ? longVotesCapped  : longVotesRaw
 shortVotes = capFamilies ? shortVotesCapped : shortVotesRaw
 
-longOk  = inSession and longVotes  >= minConfirmations and (not blockOnOpposition or shortVotes == 0)
-shortOk = inSession and shortVotes >= minConfirmations and (not blockOnOpposition or longVotes  == 0)
+longOk  = inSession and volOk and longVotes  >= minConfirmations and (not blockOnOpposition or shortVotes == 0)
+shortOk = inSession and volOk and shortVotes >= minConfirmations and (not blockOnOpposition or longVotes  == 0)
 
 // The level the trade is measured from, most specific first. A zone edge is
 // a price band someone actually defended; a range high is the loosest of
@@ -448,7 +471,7 @@ else if fvLong
     longLevel := fvLevelLong
 else if (sweepLong or srLong) and not na(lastPL)
     longLevel := lastPL
-else if (bosLong or chochLong) and not na(brokenHigh)
+else if bosLong and not na(brokenHigh)
     longLevel := brokenHigh
 else if brkLong
     longLevel := rangeHigh
@@ -460,7 +483,7 @@ else if fvShort
     shortLevel := fvLevelShort
 else if (sweepShort or srShort) and not na(lastPH)
     shortLevel := lastPH
-else if (bosShort or chochShort) and not na(brokenLow)
+else if bosShort and not na(brokenLow)
     shortLevel := brokenLow
 else if brkShort
     shortLevel := rangeLow
@@ -570,7 +593,6 @@ plot(strategy.position_size != 0 ? stopLevel : na, "Stop", color=beLocked ? colo
 plotshape(longOk  and flat, "Long signal",  shape.triangleup,   location.belowbar, color.teal,   size=size.tiny)
 plotshape(shortOk and flat, "Short signal", shape.triangledown, location.abovebar, color.maroon, size=size.tiny)
 plotchar(bosLong or bosShort,     "BOS",   "B", location.top, color.new(color.gray, 40), size=size.tiny)
-plotchar(chochLong or chochShort, "CHoCH", "C", location.top, color.new(color.fuchsia, 30), size=size.tiny)
 plotchar(sweepLong or sweepShort, "Sweep", "S", location.bottom, color.new(color.yellow, 30), size=size.tiny)
 
 // A signal whose retest price was already through the market is skipped
@@ -600,30 +622,28 @@ statCell(table t, int r, int fired, int solo, bool on) =>
     col = not on ? color.new(color.gray, 65) : solo == 0 and fired > 0 ? color.orange : color.gray
     table.cell(t, 2, r, txt, text_size=size.tiny, text_color=col)
 
-var table votes = table.new(position.top_right, 3, 12, border_width=1)
+var table votes = table.new(position.top_right, 3, 11, border_width=1)
 if barstate.islast
     table.cell(votes, 0, 0, "Family / strategy", text_size=size.tiny, text_color=color.white)
     table.cell(votes, 1, 0, str.tostring(longVotes) + "L / " + str.tostring(shortVotes) + "S",
          text_size=size.tiny, text_color=color.white)
     table.cell(votes, 2, 0, "fired/solo", text_size=size.tiny, text_color=color.white)
-    voteCell(votes, 1, "STRUCTURE", structLong, structShort, useBreakout or useBos or useChoch)
+    voteCell(votes, 1, "STRUCTURE", structLong, structShort, useBreakout or useBos)
     voteCell(votes, 2, "  range breakout", brkLong, brkShort, useBreakout)
     statCell(votes, 2, nBrk, sBrk, useBreakout)
     voteCell(votes, 3, "  BOS", bosLong, bosShort, useBos)
     statCell(votes, 3, nBos, sBos, useBos)
-    voteCell(votes, 4, "  CHoCH", chochLong, chochShort, useChoch)
-    statCell(votes, 4, nChoch, sChoch, useChoch)
-    voteCell(votes, 5, "REJECTION", rejLong, rejShort, useSR or useSweep)
-    voteCell(votes, 6, "  S/R pushback", srLong, srShort, useSR)
-    statCell(votes, 6, nSr, sSr, useSR)
-    voteCell(votes, 7, "  liquidity sweep", sweepLong, sweepShort, useSweep)
-    statCell(votes, 7, nSweep, sSweep, useSweep)
-    voteCell(votes, 8, "ZONE", zoneLong, zoneShort, useZones or useFvg)
-    voteCell(votes, 9, "  order block", obLong, obShort, useZones)
-    statCell(votes, 9, nOb, sOb, useZones)
-    voteCell(votes, 10, "  fair value gap", fvLong, fvShort, useFvg)
-    statCell(votes, 10, nFv, sFv, useFvg)
-    table.cell(votes, 0, 11, "Need", text_size=size.tiny, text_color=color.gray)
-    table.cell(votes, 1, 11, str.tostring(minConfirmations) + (capFamilies ? " of 3 families" : " uncapped") +
+    voteCell(votes, 4, "REJECTION", rejLong, rejShort, useSR or useSweep)
+    voteCell(votes, 5, "  S/R pushback", srLong, srShort, useSR)
+    statCell(votes, 5, nSr, sSr, useSR)
+    voteCell(votes, 6, "  liquidity sweep", sweepLong, sweepShort, useSweep)
+    statCell(votes, 6, nSweep, sSweep, useSweep)
+    voteCell(votes, 7, "ZONE", zoneLong, zoneShort, useZones or useFvg)
+    voteCell(votes, 8, "  order block", obLong, obShort, useZones)
+    statCell(votes, 8, nOb, sOb, useZones)
+    voteCell(votes, 9, "  fair value gap", fvLong, fvShort, useFvg)
+    statCell(votes, 9, nFv, sFv, useFvg)
+    table.cell(votes, 0, 10, "Need", text_size=size.tiny, text_color=color.gray)
+    table.cell(votes, 1, 10, str.tostring(minConfirmations) + (capFamilies ? " of 3 families" : " uncapped") +
          (useTrailing or takeProfitR > 0 ? "" : "  NO EXIT"),
          text_size=size.tiny, text_color=useTrailing or takeProfitR > 0 ? color.gray : color.red)
