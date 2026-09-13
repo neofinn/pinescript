@@ -2,38 +2,34 @@
 // =====================================================================
 // MULTI-STRATEGY CONFIRMATION SYSTEM
 //
-// Four independent reads of the same chart, and a trade only when enough
-// of them agree:
+// Three independent reads of the same chart, and a trade only when
+// enough of them agree:
 //
 //   1. BREAKOUT          — close beyond an N-bar range
-//   2. TREND             — DI+/DI- direction, gated by ADX strength
-//   3. S/R PUSHBACK      — rejection at a confirmed swing pivot
-//   4. SUPPLY/DEMAND     — rejection inside a zone left by an impulse move
+//   2. S/R PUSHBACK      — rejection at a confirmed swing pivot
+//   3. SUPPLY/DEMAND     — rejection inside a zone left by an impulse move
 //
 // THE CONFIRMATION RULE IS THE WHOLE POINT
 // Any one of these alone fires constantly and most of those fires are
-// noise. An entry needs `minConfirmations` agreeing votes AND at least
-// one of them must be an EVENT this bar, not merely a state. The trend
-// read is a state: it is true for as long as the trend lasts, so a
-// system that counted states only would trade the moment two of them
-// lined up and never stop. Breakout, S/R pushback and zone pushback are
-// events — true on the bar the thing happens and false afterwards.
-// Requiring an event means the system waits for something to occur
-// rather than for a condition to persist.
+// noise. An entry needs `minConfirmations` of them to agree.
 //
-// WHY THE TREND SLOT IS DI/ADX AND NOT SUPERTREND
-// Supertrend was tried here first and it fought the rest of the system.
-// It is an ATR trailing band, so it flips on pullbacks — and a retest of
-// support inside an uptrend is exactly when the S/R and demand-zone
-// entries fire. With `blockOnOpposition` on, the trend slot was vetoing
-// the very setups the other three strategies exist to find.
+// ALL THREE ARE EVENTS, AND THAT IS DELIBERATE
+// Each is true on the bar the thing happens and false afterwards. So
+// every vote is something that OCCURRED, never a condition that has been
+// sitting there unchanged. Earlier versions carried a fourth, trend-
+// following slot and it was a STATE — true for as long as the trend
+// lasted — which broke the rule twice over.
 //
-// Two things fix that. ADX gates the vote: below `adxFloor` the trend
-// slot votes NEITHER way rather than picking a side, so it goes quiet in
-// chop instead of casting a coin-flip vote. And `trendCanOppose` is off
-// by default, so the trend read can CONFIRM a setup but cannot VETO one.
-// DI+/DI- still cross on a deep pullback; with opposition off, that
-// costs a confirmation rather than blocking the trade.
+// Supertrend went first: an ATR trailing band flips on pullbacks, and a
+// retest of support inside an uptrend is exactly when the S/R and
+// demand-zone entries fire, so the trend slot vetoed the very setups the
+// others exist to find. DI/ADX replaced it and behaved better — ADX
+// gated the vote so it abstained in chop — but a permanently-available
+// vote still meant "2 of 4" could be satisfied by one event plus a
+// standing condition, which is not two pieces of evidence.
+//
+// Removing it entirely is the honest fix rather than a third attempt to
+// tune it. Two agreeing votes now mean two things happened.
 //
 // WHAT LAGS, AND WHY THAT IS NOT A BUG
 // A swing pivot is not confirmed until `pivotRight` bars have printed
@@ -46,8 +42,8 @@
 //
 // REPAINTING
 // Signals are evaluated on bar close (the default; do not enable
-// "calc on every tick" unless you accept that DI+/DI- can cross and
-// uncross within a bar). The breakout range uses [1] so it excludes the
+// "calc on every tick", which lets a vote appear and vanish inside a
+// bar). The breakout range uses [1] so it excludes the
 // live bar — a range that includes the bar being tested moves with
 // price and nothing ever breaks it.
 //
@@ -85,34 +81,23 @@ strategy("Multi-Strategy Confirmation",
 
 // ------------------------------------------------------------------ inputs
 grpC = "Confirmation"
-minConfirmations = input.int(2, "Votes required to enter", minval=1, maxval=4, group=grpC,
-     tooltip="How many of the four strategies must agree. 1 disables confirmation entirely.")
+minConfirmations = input.int(2, "Votes required to enter", minval=1, maxval=3, group=grpC,
+     tooltip="How many of the three strategies must agree. 1 disables confirmation entirely.")
 blockOnOpposition = input.bool(true, "Block if any strategy opposes", group=grpC,
      tooltip="With this on, a single opposing vote cancels the trade however many agree.")
-requireEvent = input.bool(true, "Require at least one fresh trigger", group=grpC,
-     tooltip="The trend read is a state and votes for as long as the trend lasts. Without this the system enters on a persisting condition rather than on something happening.")
 
 grpB = "1. Breakout"
 useBreakout = input.bool(true, "Enabled", group=grpB)
 breakoutLen = input.int(20, "Range lookback (bars)", minval=2, group=grpB)
 
-grpT = "2. Trend (ADX / DMI)"
-useTrend = input.bool(true, "Enabled", group=grpT)
-diLength = input.int(14, "DI length", minval=1, group=grpT)
-adxSmoothing = input.int(14, "ADX smoothing", minval=1, group=grpT)
-adxFloor = input.float(20.0, "ADX floor", minval=0.0, step=1.0, group=grpT,
-     tooltip="Below this the trend slot abstains instead of picking a side. 20 is the conventional line between trend and chop; raise it to make the trend vote rarer and more meaningful.")
-trendCanOppose = input.bool(false, "Trend may veto the other strategies", group=grpT,
-     tooltip="Off by default. DI+/DI- cross on deep pullbacks, which is exactly when the pushback strategies fire — letting the trend slot veto there blocks the best setups. Off, it can confirm but never block.")
-
-grpS = "3. S/R Pushback (pivots)"
+grpS = "2. S/R Pushback (pivots)"
 useSR = input.bool(true, "Enabled", group=grpS)
 pivotLeft = input.int(10, "Pivot left bars", minval=1, group=grpS)
 pivotRight = input.int(10, "Pivot right bars", minval=1, group=grpS,
      tooltip="Also the lag: a pivot is not confirmed until this many bars have printed after it.")
 srTolAtr = input.float(0.5, "Touch tolerance (x ATR)", minval=0.05, step=0.05, group=grpS)
 
-grpZ = "4. Supply / Demand Pushback"
+grpZ = "3. Supply / Demand Pushback"
 useZones = input.bool(true, "Enabled", group=grpZ)
 impulseAtr = input.float(1.5, "Impulse body (x ATR)", minval=0.5, step=0.1, group=grpZ,
      tooltip="A bar whose body exceeds this leaves the bar before it as a zone — the base the move departed from.")
@@ -129,7 +114,11 @@ grpR = "Risk"
 atrLen = input.int(14, "ATR length", minval=1, group=grpR)
 stopAtrMult = input.float(1.5, "Initial stop beyond level (x ATR)", minval=0.1, step=0.1, group=grpR)
 breakevenR = input.float(1.0, "Lock breakeven at (R multiple)", minval=0.1, step=0.1, group=grpR)
+useTrailing = input.bool(true, "Trail the stop after breakeven", group=grpR,
+     tooltip="Off, the stop stops moving once it reaches entry. Read the takeProfitR note: with no trail AND no target, nothing ever closes a winner.")
 trailTightness = input.int(2, "Trail tightness after breakeven (1 loose - 5 tight)", minval=1, maxval=5, group=grpR)
+takeProfitR = input.float(0.0, "Take profit at (R multiple, 0 = off)", minval=0.0, step=0.5, group=grpR,
+     tooltip="Needed when the trail is off. With trailing off and this at 0 the only exits are the initial stop and the breakeven stop — every trade is then a loss or a scratch and none can ever be a winner. Set 2-4 if you turn trailing off.")
 
 grpA = "Webhook alerts"
 alertSecret = input.string("", "Ingest secret", group=grpA,
@@ -160,17 +149,7 @@ rangeLow  = ta.lowest(low, breakoutLen)[1]
 brkLong  = useBreakout and not na(rangeHigh) and close > rangeHigh
 brkShort = useBreakout and not na(rangeLow)  and close < rangeLow
 
-// ------------------------------------------------------- 2. trend (DMI)
-// DI+/DI- give the direction, ADX gives permission to have an opinion at
-// all. `trending` is the whole point: with ADX under the floor both votes
-// are false, which is an ABSTENTION, not a neutral opinion — the slot adds
-// nothing to either side rather than casting a vote the data cannot support.
-[diPlus, diMinus, adx] = ta.dmi(diLength, adxSmoothing)
-trending   = not na(adx) and adx > adxFloor
-trendLong  = useTrend and trending and diPlus > diMinus
-trendShort = useTrend and trending and diMinus > diPlus
-
-// --------------------------------------------------- 3. S/R pushback
+// --------------------------------------------------- 2. S/R pushback
 // Already lagged by pivotRight when it arrives, so referencing it here
 // cannot see into the future.
 ph = ta.pivothigh(pivotLeft, pivotRight)
@@ -188,7 +167,7 @@ srTol = atrOk ? srTolAtr * atr : na
 srLong  = useSR and not na(lastPL) and not na(srTol) and low  <= lastPL + srTol and close > lastPL
 srShort = useSR and not na(lastPH) and not na(srTol) and high >= lastPH - srTol and close < lastPH
 
-// --------------------------------------------- 4. supply / demand zones
+// --------------------------------------------- 3. supply / demand zones
 // A zone is the base a move departed from: when a bar's body exceeds
 // impulseAtr x ATR, the PREVIOUS bar's range becomes the zone. Zones are
 // pruned when price closes through them (a zone that failed is not a zone)
@@ -281,25 +260,15 @@ sdLong  = inDemand
 sdShort = inSupply
 
 // ------------------------------------------------------------- votes
-longVotes  = (brkLong ? 1 : 0)  + (trendLong ? 1 : 0)  + (srLong ? 1 : 0)  + (sdLong ? 1 : 0)
-shortVotes = (brkShort ? 1 : 0) + (trendShort ? 1 : 0) + (srShort ? 1 : 0) + (sdShort ? 1 : 0)
+// Every vote is an event, so a vote count IS a count of things that
+// happened on this bar. There is no separate "was anything fresh?" test
+// any more, and no separate opposition count either: with no standing
+// vote in the mix, opposing evidence is simply the other side's votes.
+longVotes  = (brkLong ? 1 : 0)  + (srLong ? 1 : 0)  + (sdLong ? 1 : 0)
+shortVotes = (brkShort ? 1 : 0) + (srShort ? 1 : 0) + (sdShort ? 1 : 0)
 
-// An event is something that HAPPENED on this bar. The trend read is
-// excluded deliberately: it is true for as long as the trend lasts and
-// would let the system enter on a condition sitting there unchanged.
-longEvent  = brkLong  or srLong  or sdLong
-shortEvent = brkShort or srShort or sdShort
-
-// Confirming and opposing are counted separately, because they are not the
-// same question. A trend read pointing the other way on a pullback is weak
-// evidence against the trade; the same read pointing WITH it is real
-// evidence for. Unless trendCanOppose is on, the trend slot appears in the
-// vote counts above but not in the opposition counts here.
-longOpposition  = (brkLong  ? 1 : 0) + (srLong  ? 1 : 0) + (sdLong  ? 1 : 0) + ((trendCanOppose and trendLong)  ? 1 : 0)
-shortOpposition = (brkShort ? 1 : 0) + (srShort ? 1 : 0) + (sdShort ? 1 : 0) + ((trendCanOppose and trendShort) ? 1 : 0)
-
-longOk  = longVotes  >= minConfirmations and (not blockOnOpposition or shortOpposition == 0) and (not requireEvent or longEvent)
-shortOk = shortVotes >= minConfirmations and (not blockOnOpposition or longOpposition  == 0) and (not requireEvent or shortEvent)
+longOk  = longVotes  >= minConfirmations and (not blockOnOpposition or shortVotes == 0)
+shortOk = shortVotes >= minConfirmations and (not blockOnOpposition or longVotes  == 0)
 
 // The level the trade is measured from. Breakout wins when present because
 // it is the most explicit; otherwise the structure that triggered.
@@ -379,11 +348,12 @@ if strategy.position_size > 0
     if not beLocked and not na(entryR) and entryR > 0 and close >= entryPrice + breakevenR * entryR
         beLocked := true
         stopLevel := entryPrice
-    if beLocked and atrOk
+    if beLocked and atrOk and useTrailing
         // Trail only ratchets up. A stop that can loosen is not a stop.
         stopLevel := math.max(nz(stopLevel, entryPrice), runExtreme - trailAtrMult * atr)
+    tpLong = takeProfitR > 0 and not na(entryR) ? entryPrice + takeProfitR * entryR : na
     if not na(stopLevel)
-        strategy.exit("L-x", from_entry="L", stop=stopLevel, alert_message=alertMsg("exit"))
+        strategy.exit("L-x", from_entry="L", stop=stopLevel, limit=tpLong, alert_message=alertMsg("exit"))
 
 if strategy.position_size < 0
     runExtreme := na(runExtreme) ? low : math.min(runExtreme, low)
@@ -391,10 +361,11 @@ if strategy.position_size < 0
     if not beLocked and not na(entryR) and entryR > 0 and close <= entryPrice - breakevenR * entryR
         beLocked := true
         stopLevel := entryPrice
-    if beLocked and atrOk
+    if beLocked and atrOk and useTrailing
         stopLevel := math.min(nz(stopLevel, entryPrice), runExtreme + trailAtrMult * atr)
+    tpShort = takeProfitR > 0 and not na(entryR) ? entryPrice - takeProfitR * entryR : na
     if not na(stopLevel)
-        strategy.exit("S-x", from_entry="S", stop=stopLevel, alert_message=alertMsg("exit"))
+        strategy.exit("S-x", from_entry="S", stop=stopLevel, limit=tpShort, alert_message=alertMsg("exit"))
 
 if strategy.position_size == 0 and strategy.position_size[1] != 0
     stopLevel := na
@@ -431,15 +402,15 @@ voteCell(table t, int r, string name, bool l, bool s) =>
     table.cell(t, 1, r, l ? "LONG" : s ? "SHORT" : "-", text_size=size.small,
          text_color=l ? color.teal : s ? color.maroon : color.gray)
 
-var table votes = table.new(position.top_right, 2, 6, border_width=1)
+var table votes = table.new(position.top_right, 2, 5, border_width=1)
 if barstate.islast
     table.cell(votes, 0, 0, "Strategy", text_size=size.small, text_color=color.white)
     table.cell(votes, 1, 0, str.tostring(longVotes) + "L / " + str.tostring(shortVotes) + "S",
          text_size=size.small, text_color=color.white)
     voteCell(votes, 1, "Breakout", brkLong, brkShort)
-    voteCell(votes, 2, "Trend ADX " + (na(adx) ? "-" : str.tostring(adx, "#.#")), trendLong, trendShort)
-    voteCell(votes, 3, "S/R pushback", srLong, srShort)
-    voteCell(votes, 4, "Supply/Demand", sdLong, sdShort)
-    table.cell(votes, 0, 5, "Need", text_size=size.small, text_color=color.gray)
-    table.cell(votes, 1, 5, str.tostring(minConfirmations) + (requireEvent ? " + event" : ""),
-         text_size=size.small, text_color=color.gray)
+    voteCell(votes, 2, "S/R pushback", srLong, srShort)
+    voteCell(votes, 3, "Supply/Demand", sdLong, sdShort)
+    table.cell(votes, 0, 4, "Need", text_size=size.small, text_color=color.gray)
+    table.cell(votes, 1, 4, str.tostring(minConfirmations) + " of 3" +
+         (useTrailing ? "" : (takeProfitR > 0 ? "  TP " + str.tostring(takeProfitR, "#.#") + "R" : "  NO EXIT")),
+         text_size=size.small, text_color=useTrailing or takeProfitR > 0 ? color.gray : color.red)
