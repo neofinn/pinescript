@@ -14,9 +14,48 @@
 //   ZONE family
 //     5. ORDER BLOCK      — rejection inside the base of an impulse
 //     6. FAIR VALUE GAP   — rejection inside a 3-bar imbalance
+//   SESSION family
+//     7. ORB              — break of the session's opening range
 //
 //   Filters (no direction of their own, so they gate rather than vote):
-//     displacement, relative volume, session
+//     displacement, close strength, hold-for-N-bars, relative volume,
+//     volume surge, volume delta, session window
+
+// FAKEOUT CONTROL — THE THREE THAT ACTUALLY WORK
+// A fakeout is a break that closes back inside. Three filters attack it
+// from different angles and they stack:
+//
+//   1. DISPLACEMENT. The breaking bar's body must exceed a multiple of
+//      ATR. A real break leaves a body; a fakeout drifts across.
+//   2. CLOSE STRENGTH. The close must sit in the top (or bottom)
+//      `closeStrength` of the bar's own range. A break that closes
+//      mid-bar left a long wick against itself, which is the fakeout
+//      signature written into the candle.
+//   3. HOLD FOR N BARS. The strongest of the three, and the only one
+//      that is not a guess: the signal is WITHHELD for `holdBars` bars
+//      and fires only if price is still beyond the level when they have
+//      printed. A fakeout is by definition gone by then.
+//
+// Hold costs you the first N bars of the move, which is the honest
+// trade: you cannot both act immediately and know the break held. It
+// applies to the STRUCTURE family, because that is where fakeouts live —
+// rejections and zone entries are already close-confirmed against a
+// level and have nothing to fake out of.
+
+// MARKET DEPTH IS NOT AVAILABLE, AND NOTHING HERE PRETENDS OTHERWISE
+// Pine Script cannot read the order book. There is no bid size, no ask
+// size, no DOM, no Level 2 — TradingView does not expose any of it to
+// scripts, on any plan. Any indicator claiming to show "institutional
+// order flow" from a TradingView chart is inferring it from price and
+// volume, not reading it.
+//
+// The closest real substitute is VOLUME DELTA, and this script offers
+// it: `ta.requestVolumeDelta` drops to a lower timeframe and splits
+// volume into the part that traded on upticks and the part on downticks.
+// That is genuine directional information and it is still an ESTIMATE
+// built from bars, not a read of resting orders. On spot XAUUSD it is
+// estimated from tick counts, which makes it an estimate of an estimate;
+// on GC1! it is built from real traded size.
 //
 // WHY FAMILIES, AND WHY THIS IS THE IMPORTANT PART
 // Most of these are computed from the same swing pivots. A range
@@ -124,8 +163,8 @@ strategy("Multi-Strategy Confirmation",
 
 // ------------------------------------------------------------------ inputs
 grpC = "Confirmation"
-minConfirmations = input.int(2, "Votes required to enter", minval=1, maxval=3, group=grpC,
-     tooltip="Votes are counted per FAMILY when capFamilies is on, so the ceiling is 3: structure, rejection, zone.")
+minConfirmations = input.int(2, "Votes required to enter", minval=1, maxval=4, group=grpC,
+     tooltip="Votes are counted per FAMILY when capFamilies is on, so the ceiling is 4: structure, rejection, zone, session.")
 capFamilies = input.bool(true, "One vote per family (recommended)", group=grpC,
      tooltip="Correlated signals are computed from the same pivots. Without this, switching on more strategies makes the filter LOOSER, not tighter, because one observation gets counted several times.")
 blockOnOpposition = input.bool(true, "Block if any family opposes", group=grpC)
@@ -134,10 +173,22 @@ grpF = "Filters"
 requireDisplacement = input.bool(false, "Structural breaks need displacement", group=grpF,
      tooltip="The breaking bar's body must exceed displacementAtr x ATR. Applies to the STRUCTURE family only — a rejection is not supposed to be violent.")
 displacementAtr = input.float(0.8, "Displacement body (x ATR)", minval=0.1, step=0.1, group=grpF)
+
+grpK = "Fakeout control"
+closeStrength = input.float(0.0, "Break close within its own range (0-1)", minval=0.0, maxval=1.0, step=0.05, group=grpK,
+     tooltip="0 disables. 0.6 means a bullish break must close in the top 40% of its bar. A break closing mid-bar left a long wick against itself, which is what a fakeout looks like in the candle.")
+holdBars = input.int(0, "Break must hold for N bars", minval=0, maxval=20, group=grpK,
+     tooltip="The strongest fakeout filter and the only one that is not a guess. The signal is withheld this many bars and fires only if price is STILL beyond the level. Costs you the first N bars of the move — you cannot both act immediately and know the break held. 0 disables.")
 useVolume = input.bool(false, "Signal bar needs above-average volume", group=grpF,
      tooltip="A participation filter, not a vote — volume has no direction. On spot XAUUSD this is TICK COUNT, not contracts: it measures requote frequency, a decent proxy for activity and not a measurement of size. On GC1! it is real traded volume.")
 volMult = input.float(1.5, "Volume vs its average (x)", minval=0.5, step=0.1, group=grpF)
 volLen = input.int(20, "Volume average length", minval=2, group=grpF)
+useVolSurge = input.bool(false, "Require a volume SURGE, not just above average", group=grpF,
+     tooltip="A z-score: how many standard deviations above its own mean this bar traded. Above-average volume is common; a 2-sigma surge is a step change, which is what 'sudden' means numerically.")
+volZ = input.float(2.0, "Surge z-score", minval=0.5, step=0.25, group=grpF)
+useVolDelta = input.bool(false, "Require volume delta to agree with the trade", group=grpF,
+     tooltip="The closest thing to order flow that Pine can see. Drops to a lower timeframe and splits volume into uptick and downtick parts. It is an ESTIMATE from bars, not a read of the order book — Pine has no access to the book at all. Errors if the lower timeframe is not finer than the chart's.")
+deltaTf = input.timeframe("1", "Volume delta lower timeframe", group=grpF)
 useSession = input.bool(false, "Trade only inside a session", group=grpF)
 sessionSpec = input.session("0700-1600", "Session (exchange time)", group=grpF,
      tooltip="London plus the New York overlap in UTC terms. Check your chart's timezone — this is evaluated in exchange time, not yours.")
@@ -172,6 +223,12 @@ grp6 = "6. Fair value gap (zone)"
 useFvg = input.bool(true, "Enabled", group=grp6,
      tooltip="A three-bar imbalance: bar 1's high below bar 3's low leaves a range price traded through without trading in. Entry is the return to it.")
 fvgMinAtr = input.float(0.25, "Minimum gap size (x ATR)", minval=0.0, step=0.05, group=grp6)
+
+grp7 = "7. Opening range breakout (session)"
+useOrb = input.bool(false, "Enabled", group=grp7,
+     tooltip="The session's first minutes set a range; the break of it is the signal. Fires at most once per side per day by construction, which is the cheapest way to get from many trades to few.")
+orbSession = input.session("0800-0830", "Opening range window (exchange time)", group=grp7,
+     tooltip="Gold: 0800-0830 is the London open, 1330-1400 the New York cash open. Check your chart's timezone — this is exchange time, not yours.")
 
 grpZ = "Zone handling (order blocks and FVGs)"
 zoneMaxAge = input.int(200, "Zone max age (bars)", minval=10, group=grpZ)
@@ -213,7 +270,22 @@ inSession = not useSession or not na(time(timeframe.period, sessionSpec))
 // feed that does not report it must not silently pass the filter, so an
 // absent series fails the test rather than being treated as sufficient.
 volAvg = ta.sma(volume, volLen)
+volSd = ta.stdev(volume, volLen)
 volOk = not useVolume or (not na(volume) and not na(volAvg) and volAvg > 0 and volume > volMult * volAvg)
+
+// "Sudden" as a number. Above-average volume is common; a 2-sigma bar is a
+// step change. Zero standard deviation means the series cannot support a
+// z-score, so the filter fails rather than dividing by zero.
+volZScore = not na(volSd) and volSd > 0 and not na(volAvg) ? (volume - volAvg) / volSd : na
+volSurgeOk = not useVolSurge or (not na(volZScore) and volZScore >= volZ)
+
+// The nearest thing to order flow Pine can reach. An ESTIMATE assembled
+// from lower-timeframe bars, never a read of resting orders — see the
+// header. Called unconditionally because request functions may not sit
+// inside a conditional block.
+[dOpen, dMax, dMin, dLast] = ta.requestVolumeDelta(deltaTf)
+deltaOkLong  = not useVolDelta or (not na(dLast) and dLast > 0)
+deltaOkShort = not useVolDelta or (not na(dLast) and dLast < 0)
 
 // --------------------------------------------------------------- pivots
 // Already lagged by pivotRight when they arrive, so referencing them here
@@ -382,6 +454,43 @@ obShort = not na(obLevelShort)
 fvLong  = not na(fvLevelLong)
 fvShort = not na(fvLevelShort)
 
+// ----------------------------------------------- SESSION 7. opening range
+// The session's first minutes set a range and the break of it is the
+// signal. At most one per side per day by construction, which is the
+// cheapest way to go from many trades to few — and it is anchored to the
+// CLOCK rather than to the pivots everything else here derives from, so
+// its vote is genuinely independent evidence rather than the same
+// observation wearing a different name.
+var float orbHigh = na
+var float orbLow = na
+var bool orbReady = false
+var bool orbLongDone = false
+var bool orbShortDone = false
+
+inOrbWindow = not na(time(timeframe.period, orbSession))
+newDay = ta.change(time("D")) != 0
+
+if newDay
+    orbHigh := na
+    orbLow := na
+    orbReady := false
+    orbLongDone := false
+    orbShortDone := false
+
+if inOrbWindow
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow  := na(orbLow)  ? low  : math.min(orbLow, low)
+else if not na(orbHigh)
+    // The window has closed and a range exists, so it can now be broken.
+    orbReady := true
+
+orbLong  = useOrb and orbReady and not orbLongDone  and not na(orbHigh) and close > orbHigh
+orbShort = useOrb and orbReady and not orbShortDone and not na(orbLow)  and close < orbLow
+if orbLong
+    orbLongDone := true
+if orbShort
+    orbShortDone := true
+
 // ------------------------------------------------- contribution counters
 // "Did this strategy do anything?" is a question the chart should answer
 // rather than one you discover by toggling a switch and squinting at a
@@ -401,6 +510,7 @@ srFired    = srLong    or srShort
 sweepFired = sweepLong or sweepShort
 obFired    = obLong    or obShort
 fvFired    = fvLong    or fvShort
+orbFired   = orbLong   or orbShort
 
 var int nBrk = 0
 var int nBos = 0
@@ -408,12 +518,14 @@ var int nSr = 0
 var int nSweep = 0
 var int nOb = 0
 var int nFv = 0
+var int nOrb = 0
 var int sBrk = 0
 var int sBos = 0
 var int sSr = 0
 var int sSweep = 0
 var int sOb = 0
 var int sFv = 0
+var int sOrb = 0
 
 if barstate.isconfirmed
     if brkFired
@@ -434,32 +546,85 @@ if barstate.isconfirmed
     if fvFired
         nFv += 1
         sFv += obFired ? 0 : 1
+    if orbFired
+        nOrb += 1
+        // Sole member of its family, so every fire is a solo fire.
+        sOrb += 1
 
-// ---------------------------------------------------- displacement gate
-// Applies to the STRUCTURE family only. An institutional break leaves a
-// body; a drift across the line is the false-break signature.
+// ------------------------------------------------- fakeout control gates
+// Displacement: an institutional break leaves a body, a drift across the
+// line is the false-break signature. Close strength: a break closing
+// mid-bar left a long wick against itself.
 displaced = not requireDisplacement or (atrOk and body > displacementAtr * atr)
-structLong  = (brkLong  or bosLong)  and displaced
-structShort = (brkShort or bosShort) and displaced
-rejLong   = srLong  or sweepLong
-rejShort  = srShort or sweepShort
-zoneLong  = obLong  or fvLong
-zoneShort = obShort or fvShort
+barRange = high - low
+closeUp = barRange > 0 ? (close - low) / barRange : 0.5
+closeDn = barRange > 0 ? (high - close) / barRange : 0.5
+strongUp = closeStrength <= 0 or closeUp >= closeStrength
+strongDn = closeStrength <= 0 or closeDn >= closeStrength
+
+structLevelLongRaw  = brkLong  ? rangeHigh : (bosLong  and not na(brokenHigh) ? brokenHigh : na)
+structLevelShortRaw = brkShort ? rangeLow  : (bosShort and not na(brokenLow)  ? brokenLow  : na)
+rawStructLong  = (brkLong  or bosLong)  and displaced and strongUp and not na(structLevelLongRaw)
+rawStructShort = (brkShort or bosShort) and displaced and strongDn and not na(structLevelShortRaw)
+
+// Hold-for-N-bars. The signal is withheld and fires only if price is STILL
+// beyond the level once N bars have printed; a fakeout is gone by then. One
+// break is armed at a time — a second break while one is pending would
+// otherwise overwrite the level being tested and confirm against the wrong
+// number.
+var float armLevel = na
+var int armBar = na
+var int armDir = 0
+
+bool structLong = false
+bool structShort = false
+float structLevelLong = na
+float structLevelShort = na
+
+if holdBars == 0
+    structLong := rawStructLong
+    structShort := rawStructShort
+    structLevelLong := structLevelLongRaw
+    structLevelShort := structLevelShortRaw
+else
+    if na(armBar) and (rawStructLong or rawStructShort)
+        armLevel := rawStructLong ? structLevelLongRaw : structLevelShortRaw
+        armBar := bar_index
+        armDir := rawStructLong ? 1 : -1
+    if not na(armBar) and bar_index - armBar >= holdBars
+        if armDir == 1 and close > armLevel
+            structLong := true
+            structLevelLong := armLevel
+        if armDir == -1 and close < armLevel
+            structShort := true
+            structLevelShort := armLevel
+        // Cleared either way: a break that failed the hold is spent, not
+        // re-tested on every later bar.
+        armBar := na
+        armDir := 0
+        armLevel := na
+
+rejLong    = srLong  or sweepLong
+rejShort   = srShort or sweepShort
+zoneLong   = obLong  or fvLong
+zoneShort  = obShort or fvShort
+sessLong   = orbLong
+sessShort  = orbShort
 
 // ------------------------------------------------------------- votes
 // Per family when capped, per strategy when not. Uncapped is offered to
 // show what the difference costs, not because it is a reasonable setting:
 // correlated signals derived from one set of pivots make the filter looser
 // the more of them you enable.
-longVotesCapped  = (structLong  ? 1 : 0) + (rejLong  ? 1 : 0) + (zoneLong  ? 1 : 0)
-shortVotesCapped = (structShort ? 1 : 0) + (rejShort ? 1 : 0) + (zoneShort ? 1 : 0)
-longVotesRaw  = (brkLong  ? 1 : 0) + (bosLong  ? 1 : 0) + (srLong  ? 1 : 0) + (sweepLong  ? 1 : 0) + (obLong  ? 1 : 0) + (fvLong  ? 1 : 0)
-shortVotesRaw = (brkShort ? 1 : 0) + (bosShort ? 1 : 0) + (srShort ? 1 : 0) + (sweepShort ? 1 : 0) + (obShort ? 1 : 0) + (fvShort ? 1 : 0)
+longVotesCapped  = (structLong  ? 1 : 0) + (rejLong  ? 1 : 0) + (zoneLong  ? 1 : 0) + (sessLong  ? 1 : 0)
+shortVotesCapped = (structShort ? 1 : 0) + (rejShort ? 1 : 0) + (zoneShort ? 1 : 0) + (sessShort ? 1 : 0)
+longVotesRaw  = (brkLong  ? 1 : 0) + (bosLong  ? 1 : 0) + (srLong  ? 1 : 0) + (sweepLong  ? 1 : 0) + (obLong  ? 1 : 0) + (fvLong  ? 1 : 0) + (orbLong  ? 1 : 0)
+shortVotesRaw = (brkShort ? 1 : 0) + (bosShort ? 1 : 0) + (srShort ? 1 : 0) + (sweepShort ? 1 : 0) + (obShort ? 1 : 0) + (fvShort ? 1 : 0) + (orbShort ? 1 : 0)
 longVotes  = capFamilies ? longVotesCapped  : longVotesRaw
 shortVotes = capFamilies ? shortVotesCapped : shortVotesRaw
 
-longOk  = inSession and volOk and longVotes  >= minConfirmations and (not blockOnOpposition or shortVotes == 0)
-shortOk = inSession and volOk and shortVotes >= minConfirmations and (not blockOnOpposition or longVotes  == 0)
+longOk  = inSession and volOk and volSurgeOk and deltaOkLong and longVotes  >= minConfirmations and (not blockOnOpposition or shortVotes == 0)
+shortOk = inSession and volOk and volSurgeOk and deltaOkShort and shortVotes >= minConfirmations and (not blockOnOpposition or longVotes  == 0)
 
 // The level the trade is measured from, most specific first. A zone edge is
 // a price band someone actually defended; a range high is the loosest of
@@ -471,10 +636,10 @@ else if fvLong
     longLevel := fvLevelLong
 else if (sweepLong or srLong) and not na(lastPL)
     longLevel := lastPL
-else if bosLong and not na(brokenHigh)
-    longLevel := brokenHigh
-else if brkLong
-    longLevel := rangeHigh
+else if orbLong and not na(orbHigh)
+    longLevel := orbHigh
+else if structLong and not na(structLevelLong)
+    longLevel := structLevelLong
 
 float shortLevel = na
 if obShort
@@ -483,10 +648,10 @@ else if fvShort
     shortLevel := fvLevelShort
 else if (sweepShort or srShort) and not na(lastPH)
     shortLevel := lastPH
-else if bosShort and not na(brokenLow)
-    shortLevel := brokenLow
-else if brkShort
-    shortLevel := rangeLow
+else if orbShort and not na(orbLow)
+    shortLevel := orbLow
+else if structShort and not na(structLevelShort)
+    shortLevel := structLevelShort
 
 // ------------------------------------------------------------ entries
 flat = strategy.position_size == 0
@@ -594,6 +759,11 @@ plotshape(longOk  and flat, "Long signal",  shape.triangleup,   location.belowba
 plotshape(shortOk and flat, "Short signal", shape.triangledown, location.abovebar, color.maroon, size=size.tiny)
 plotchar(bosLong or bosShort,     "BOS",   "B", location.top, color.new(color.gray, 40), size=size.tiny)
 plotchar(sweepLong or sweepShort, "Sweep", "S", location.bottom, color.new(color.yellow, 30), size=size.tiny)
+plot(useOrb ? orbHigh : na, "ORB high", color=color.new(color.purple, 20), style=plot.style_linebr, linewidth=2)
+plot(useOrb ? orbLow : na, "ORB low", color=color.new(color.purple, 20), style=plot.style_linebr, linewidth=2)
+// A break waiting out its hold. Visible because "why is there no signal
+// on that obvious break" should be answerable from the chart.
+plotchar(not na(armBar), "Break on hold", "·", location.top, color.new(color.aqua, 30), size=size.tiny)
 
 // A signal whose retest price was already through the market is skipped
 // rather than filled at the market. Marked, because a triangle with no
@@ -622,7 +792,7 @@ statCell(table t, int r, int fired, int solo, bool on) =>
     col = not on ? color.new(color.gray, 65) : solo == 0 and fired > 0 ? color.orange : color.gray
     table.cell(t, 2, r, txt, text_size=size.tiny, text_color=col)
 
-var table votes = table.new(position.top_right, 3, 11, border_width=1)
+var table votes = table.new(position.top_right, 3, 13, border_width=1)
 if barstate.islast
     table.cell(votes, 0, 0, "Family / strategy", text_size=size.tiny, text_color=color.white)
     table.cell(votes, 1, 0, str.tostring(longVotes) + "L / " + str.tostring(shortVotes) + "S",
@@ -643,7 +813,11 @@ if barstate.islast
     statCell(votes, 8, nOb, sOb, useZones)
     voteCell(votes, 9, "  fair value gap", fvLong, fvShort, useFvg)
     statCell(votes, 9, nFv, sFv, useFvg)
-    table.cell(votes, 0, 10, "Need", text_size=size.tiny, text_color=color.gray)
-    table.cell(votes, 1, 10, str.tostring(minConfirmations) + (capFamilies ? " of 3 families" : " uncapped") +
-         (useTrailing or takeProfitR > 0 ? "" : "  NO EXIT"),
+    voteCell(votes, 10, "SESSION", sessLong, sessShort, useOrb)
+    voteCell(votes, 11, "  opening range", orbLong, orbShort, useOrb)
+    statCell(votes, 11, nOrb, sOrb, useOrb)
+    table.cell(votes, 0, 12, "Need", text_size=size.tiny, text_color=color.gray)
+    table.cell(votes, 1, 12, str.tostring(minConfirmations) + (capFamilies ? " of 4 families" : " uncapped") +
+         (useTrailing or takeProfitR > 0 ? "" : "  NO EXIT") +
+         (holdBars > 0 ? "  hold " + str.tostring(holdBars) : ""),
          text_size=size.tiny, text_color=useTrailing or takeProfitR > 0 ? color.gray : color.red)
