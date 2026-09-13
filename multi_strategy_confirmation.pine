@@ -2,7 +2,7 @@
 // =====================================================================
 // MULTI-STRATEGY CONFIRMATION SYSTEM
 //
-// Four independent read of the same chart, and a trade only when enough
+// Four independent reads of the same chart, and a trade only when enough
 // of them agree:
 //
 //   1. BREAKOUT          — close beyond an N-bar range
@@ -115,7 +115,7 @@ trailTightness = input.int(2, "Trail tightness after breakeven (1 loose - 5 tigh
 
 grpA = "Webhook alerts"
 alertSecret = input.string("", "Ingest secret", group=grpA,
-     tooltip="From scripts/start_here.sh. Left blank, the alert still fires but the gateway will reject it.")
+     tooltip="Leave blank if you are not routing to a webhook.")
 alertQty = input.int(1, "Quantity to send", minval=1, group=grpA)
 
 // ------------------------------------------------------------------- atr
@@ -243,7 +243,6 @@ float demandLevel = na
 if useZones and array.size(demTop) > 0
     for i = 0 to array.size(demTop) - 1
         t = array.get(demTop, i)
-        b = array.get(demBot, i)
         if low <= t and close > t
             inDemand := true
             demandLevel := na(demandLevel) ? t : math.max(demandLevel, t)
@@ -252,7 +251,6 @@ inSupply = false
 float supplyLevel = na
 if useZones and array.size(supTop) > 0
     for i = 0 to array.size(supTop) - 1
-        t = array.get(supTop, i)
         b = array.get(supBot, i)
         if high >= b and close < b
             inSupply := true
