@@ -174,11 +174,6 @@ requireDisplacement = input.bool(false, "Structural breaks need displacement", g
      tooltip="The breaking bar's body must exceed displacementAtr x ATR. Applies to the STRUCTURE family only — a rejection is not supposed to be violent.")
 displacementAtr = input.float(0.8, "Displacement body (x ATR)", minval=0.1, step=0.1, group=grpF)
 
-grpK = "Fakeout control"
-closeStrength = input.float(0.0, "Break close within its own range (0-1)", minval=0.0, maxval=1.0, step=0.05, group=grpK,
-     tooltip="0 disables. 0.6 means a bullish break must close in the top 40% of its bar. A break closing mid-bar left a long wick against itself, which is what a fakeout looks like in the candle.")
-holdBars = input.int(0, "Break must hold for N bars", minval=0, maxval=20, group=grpK,
-     tooltip="The strongest fakeout filter and the only one that is not a guess. The signal is withheld this many bars and fires only if price is STILL beyond the level. Costs you the first N bars of the move — you cannot both act immediately and know the break held. 0 disables.")
 useVolume = input.bool(false, "Signal bar needs above-average volume", group=grpF,
      tooltip="A participation filter, not a vote — volume has no direction. On spot XAUUSD this is TICK COUNT, not contracts: it measures requote frequency, a decent proxy for activity and not a measurement of size. On GC1! it is real traded volume.")
 volMult = input.float(1.5, "Volume vs its average (x)", minval=0.5, step=0.1, group=grpF)
@@ -192,6 +187,12 @@ deltaTf = input.timeframe("1", "Volume delta lower timeframe", group=grpF)
 useSession = input.bool(false, "Trade only inside a session", group=grpF)
 sessionSpec = input.session("0700-1600", "Session (exchange time)", group=grpF,
      tooltip="London plus the New York overlap in UTC terms. Check your chart's timezone — this is evaluated in exchange time, not yours.")
+
+grpK = "Fakeout control"
+closeStrength = input.float(0.0, "Break close within its own range (0-1)", minval=0.0, maxval=1.0, step=0.05, group=grpK,
+     tooltip="0 disables. 0.6 means a bullish break must close in the top 40% of its bar. A break closing mid-bar left a long wick against itself, which is what a fakeout looks like in the candle.")
+holdBars = input.int(0, "Break must hold for N bars", minval=0, maxval=20, group=grpK,
+     tooltip="The strongest fakeout filter and the only one that is not a guess. The signal is withheld this many bars and fires only if price is STILL beyond the level. Costs you the first N bars of the move — you cannot both act immediately and know the break held. 0 disables.")
 
 grpP = "Swing pivots (feeds structure, S/R and sweeps)"
 pivotLeft = input.int(10, "Pivot left bars", minval=1, group=grpP)
