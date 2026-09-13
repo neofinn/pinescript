@@ -235,7 +235,7 @@ rangeLow  = ta.lowest(low, breakoutLen)[1]
 brkLong  = useBreakout and not na(rangeHigh) and close > rangeHigh
 brkShort = useBreakout and not na(rangeLow)  and close < rangeLow
 
-// --------------------------------------------- STRUCTURE 2/3. BOS, CHoCH
+// ------------------------------------------------- STRUCTURE 2. BOS
 // One swing level produces at most ONE break event. Tracking the level
 // already broken is what makes this an event rather than a state: without
 // it, every subsequent close beyond the same high re-signals, and the
@@ -268,19 +268,19 @@ if brokeLow
 bosLong  := useBos and bosLong
 bosShort := useBos and bosShort
 
-// ------------------------------------------- REJECTION 4. S/R pushback
+// ------------------------------------------- REJECTION 3. S/R pushback
 srTol = atrOk ? srTolAtr * atr : na
 srLong  = useSR and not na(lastPL) and not na(srTol) and low  <= lastPL + srTol and close > lastPL
 srShort = useSR and not na(lastPH) and not na(srTol) and high >= lastPH - srTol and close < lastPH
 
-// ---------------------------------------- REJECTION 5. liquidity sweep
+// ---------------------------------------- REJECTION 4. liquidity sweep
 // Strictly beyond the level and back, which is the difference from a
 // pushback: the stops under that low were actually taken before price
 // rejected. A pushback only requires price to come near.
 sweepLong  = useSweep and not na(lastPL) and low  < lastPL and close > lastPL
 sweepShort = useSweep and not na(lastPH) and high > lastPH and close < lastPH
 
-// ------------------------------------------------ zone machinery (6, 7)
+// ------------------------------------------------ zone machinery (5, 6)
 var array<float> obDemTop = array.new<float>()
 var array<float> obDemBot = array.new<float>()
 var array<int>   obDemBar = array.new<int>()
@@ -347,7 +347,7 @@ zoneHitShort(array<float> bots) =>
                 lvl := na(lvl) ? b : math.min(lvl, b)
     lvl
 
-// ------------------------------------------------- ZONE 6. order blocks
+// ------------------------------------------------- ZONE 5. order blocks
 isImpulse = atrOk and body > impulseAtr * atr
 if useZones and isImpulse and bar_index > 1
     if close > open
@@ -355,7 +355,7 @@ if useZones and isImpulse and bar_index > 1
     else
         pushZone(obSupTop, obSupBot, obSupBar, high[1], low[1], color.maroon)
 
-// ---------------------------------------------- ZONE 7. fair value gaps
+// ---------------------------------------------- ZONE 6. fair value gaps
 // Three bars: the gap is the range bar 3 never traded into, left behind
 // because bar 2 moved too fast. Measured on the CLOSED bars [1] and [3]
 // so the live bar cannot create or erase one.
