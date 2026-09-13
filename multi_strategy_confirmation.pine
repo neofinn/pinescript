@@ -379,12 +379,9 @@ shortVotes = capFamilies ? shortVotesCapped : shortVotesRaw
 longOk  = inSession and longVotes  >= minConfirmations and (not blockOnOpposition or shortVotes == 0)
 shortOk = inSession and shortVotes >= minConfirmations and (not blockOnOpposition or longVotes  == 0)
 
-// The level the trade is measured from, most specific first. A zone edge
-// is an actual price band someone defended; a range high is the loosest of
-// the three, so it is the fallback rather than the default.
-// Most specific level first. A zone edge is a price band someone actually
-// defended; a range high is the loosest of them, so it is the fallback
-// rather than the default.
+// The level the trade is measured from, most specific first. A zone edge is
+// a price band someone actually defended; a range high is the loosest of
+// them, so it is the fallback rather than the default.
 float longLevel = na
 if obLong
     longLevel := obLevelLong
