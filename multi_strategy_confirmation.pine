@@ -49,13 +49,18 @@
 // order flow" from a TradingView chart is inferring it from price and
 // volume, not reading it.
 //
-// The closest real substitute is VOLUME DELTA, and this script offers
-// it: `ta.requestVolumeDelta` drops to a lower timeframe and splits
-// volume into the part that traded on upticks and the part on downticks.
-// That is genuine directional information and it is still an ESTIMATE
-// built from bars, not a read of resting orders. On spot XAUUSD it is
-// estimated from tick counts, which makes it an estimate of an estimate;
-// on GC1! it is built from real traded size.
+// The closest real substitute is VOLUME DELTA, and this script builds it
+// from `request.security_lower_tf`: pull the lower-timeframe bars inside
+// the current one and split their volume by whether each closed up or
+// down. (`ta.requestVolumeDelta` would do the same thing, but it lives in
+// TradingView's ta LIBRARY rather than the built-in ta namespace, so
+// calling it without an import does not compile — it was tried.)
+//
+// That is genuine directional information and it is still an ESTIMATE: a
+// lower-timeframe bar that closed up is ASSUMED to be buying, which is a
+// reasonable proxy and not a fact. On spot XAUUSD the volume being split
+// is tick counts, making it an estimate of an estimate; on GC1! it is
+// real traded size.
 //
 // WHY FAMILIES, AND WHY THIS IS THE IMPORTANT PART
 // Most of these are computed from the same swing pivots. A range
@@ -280,13 +285,42 @@ volOk = not useVolume or (not na(volume) and not na(volAvg) and volAvg > 0 and v
 volZScore = not na(volSd) and volSd > 0 and not na(volAvg) ? (volume - volAvg) / volSd : na
 volSurgeOk = not useVolSurge or (not na(volZScore) and volZScore >= volZ)
 
-// The nearest thing to order flow Pine can reach. An ESTIMATE assembled
-// from lower-timeframe bars, never a read of resting orders — see the
-// header. Called unconditionally because request functions may not sit
-// inside a conditional block.
-[dOpen, dMax, dMin, dLast] = ta.requestVolumeDelta(deltaTf)
-deltaOkLong  = not useVolDelta or (not na(dLast) and dLast > 0)
-deltaOkShort = not useVolDelta or (not na(dLast) and dLast < 0)
+// The nearest thing to order flow Pine can reach, built here rather than
+// called: `ta.requestVolumeDelta` is in TradingView's ta LIBRARY, not the
+// built-in ta namespace, so calling it without an import fails to compile.
+// This assembles the same measure from `request.security_lower_tf`, which
+// is a genuine built-in: pull the lower-timeframe bars inside this one and
+// split their volume by whether each closed up or down.
+//
+// It remains an ESTIMATE from bars and never a read of resting orders — a
+// lower-timeframe bar that closed up is assumed to be buying, which is a
+// reasonable proxy and not a fact. See the header.
+//
+// Requested unconditionally because request functions may not sit inside a
+// conditional block.
+ltfClose = request.security_lower_tf(syminfo.tickerid, deltaTf, close)
+ltfOpen  = request.security_lower_tf(syminfo.tickerid, deltaTf, open)
+ltfVol   = request.security_lower_tf(syminfo.tickerid, deltaTf, volume)
+
+float volDelta = na
+ltfCount = math.min(array.size(ltfVol), math.min(array.size(ltfClose), array.size(ltfOpen)))
+if useVolDelta and ltfCount > 0
+    float upVol = 0.0
+    float dnVol = 0.0
+    for i = 0 to ltfCount - 1
+        v = array.get(ltfVol, i)
+        c = array.get(ltfClose, i)
+        o = array.get(ltfOpen, i)
+        if c > o
+            upVol += v
+        else if c < o
+            dnVol += v
+    volDelta := upVol - dnVol
+
+// Fails closed, like every other filter here: no lower-timeframe data means
+// the filter is unsatisfied, not satisfied.
+deltaOkLong  = not useVolDelta or (not na(volDelta) and volDelta > 0)
+deltaOkShort = not useVolDelta or (not na(volDelta) and volDelta < 0)
 
 // --------------------------------------------------------------- pivots
 // Already lagged by pivotRight when they arrive, so referencing them here
