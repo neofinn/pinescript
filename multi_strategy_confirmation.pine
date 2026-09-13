@@ -2,7 +2,7 @@
 // =====================================================================
 // MULTI-STRATEGY CONFIRMATION SYSTEM
 //
-// Seven reads of the same chart, each switchable, and a trade only when
+// Eight reads of the same chart, each switchable, and a trade only when
 // enough INDEPENDENT ones agree:
 //
 //   STRUCTURE family
@@ -16,10 +16,20 @@
 //     6. FAIR VALUE GAP   — rejection inside a 3-bar imbalance
 //   SESSION family
 //     7. ORB              — break of the session's opening range
+//   VWAP family
+//     8. EMA/VWAP CROSS   — EMA crosses the session VWAP
 //
 //   Filters (no direction of their own, so they gate rather than vote):
 //     displacement, close strength, hold-for-N-bars, relative volume,
 //     volume surge, volume delta, session window
+//
+// VWAP IS VOLUME-WEIGHTED, WHICH ON SPOT GOLD MEANS TICK-WEIGHTED
+// `ta.vwap` weights price by the volume series the feed reports. On spot
+// XAUUSD that is tick count, so the "volume" doing the weighting is
+// requote frequency rather than size — a reasonable proxy and not the
+// institutional average price the name suggests. On GC1! it is the real
+// thing. It resets each session, which is why an EMA crossing it is an
+// intraday signal rather than a trend one.
 
 // FAKEOUT CONTROL — THE THREE THAT ACTUALLY WORK
 // A fakeout is a break that closes back inside. Three filters attack it
@@ -77,7 +87,7 @@
 // how a confirmation system quietly becomes a single-signal system with
 // extra steps.
 //
-// ALL SEVEN ARE EVENTS
+// ALL EIGHT ARE EVENTS
 // Each is true on the bar the thing happens and false afterwards, so a
 // vote count is a count of things that OCCURRED. An earlier version
 // carried a trend-following slot (Supertrend, then DI/ADX) and it was a
@@ -142,6 +152,21 @@
 // FIRED/SOLO columns exist so the next redundant idea is visible in one
 // glance instead of one A/B test.
 //
+// ON "PROPHECY"-STYLE OUTPUT
+// The commercial indicator of that name advertises live bias, entry, stop,
+// TP1/TP2/TP3, breakeven and trailing, and attributes it to orderflow. It
+// is closed source, so none of its logic is reproduced here, and the
+// orderflow claim meets the same wall described above: Pine cannot read
+// the book, so any such product is inferring from price and volume too.
+//
+// What it lists is mostly already here — bias, entry, stop, breakeven and
+// trailing all predate this note. What was missing is SCALED EXITS, so
+// `useScaledExit` adds them: TP1 and TP2 take a configured percentage off
+// and TP3 closes the remainder, each at an R multiple of the trade's own
+// risk. The stop rides on every leg, so a runner is never left unprotected.
+// Off by default, because the single-exit path is the one with a backtest
+// behind it.
+//
 // ON VERY HIGH WIN RATES
 // This system will not produce one, and a version that did would be worse.
 // Win rate and profit are close to independent: a 25% win rate at 10.9:1
@@ -164,12 +189,13 @@ strategy("Multi-Strategy Confirmation",
      commission_type      = strategy.commission.percent,
      commission_value     = 0.03,
      slippage             = 2,
-     max_boxes_count      = 500)
+     max_boxes_count      = 500,
+     max_labels_count     = 100)
 
 // ------------------------------------------------------------------ inputs
 grpC = "Confirmation"
-minConfirmations = input.int(2, "Votes required to enter", minval=1, maxval=4, group=grpC,
-     tooltip="Votes are counted per FAMILY when capFamilies is on, so the ceiling is 4: structure, rejection, zone, session.")
+minConfirmations = input.int(2, "Votes required to enter", minval=1, maxval=5, group=grpC,
+     tooltip="Votes are counted per FAMILY when capFamilies is on, so the ceiling is 5: structure, rejection, zone, session, vwap.")
 capFamilies = input.bool(true, "One vote per family (recommended)", group=grpC,
      tooltip="Correlated signals are computed from the same pivots. Without this, switching on more strategies makes the filter LOOSER, not tighter, because one observation gets counted several times.")
 blockOnOpposition = input.bool(true, "Block if any family opposes", group=grpC)
@@ -235,6 +261,21 @@ useOrb = input.bool(false, "Enabled", group=grp7,
      tooltip="The session's first minutes set a range; the break of it is the signal. Fires at most once per side per day by construction, which is the cheapest way to get from many trades to few.")
 orbSession = input.session("0800-0830", "Opening range window (exchange time)", group=grp7,
      tooltip="Gold: 0800-0830 is the London open, 1330-1400 the New York cash open. Check your chart's timezone — this is exchange time, not yours.")
+
+grp8 = "8. EMA / VWAP cross (vwap)"
+useEmaVwap = input.bool(false, "Enabled", group=grp8,
+     tooltip="The CROSS is the signal, not the side — an EMA sitting above VWAP is a state and would break the one-vote-per-event rule the rest of this script runs on.")
+emaLen = input.int(21, "EMA length", minval=1, group=grp8)
+
+grpT = "Targets (scaled exit)"
+useScaledExit = input.bool(false, "Scale out at TP1 / TP2 / TP3", group=grpT,
+     tooltip="Off by default: the single-exit path is the one with a backtest behind it. On, TP1 and TP2 take their percentage off and TP3 closes the remainder. The stop rides on every leg, so the runner is never unprotected.")
+tp1R = input.float(1.0, "TP1 at (R)", minval=0.1, step=0.1, group=grpT)
+tp1Pct = input.int(40, "TP1 takes (% of position)", minval=1, maxval=99, group=grpT)
+tp2R = input.float(2.0, "TP2 at (R)", minval=0.1, step=0.1, group=grpT)
+tp2Pct = input.int(30, "TP2 takes (% of position)", minval=1, maxval=99, group=grpT)
+tp3R = input.float(3.0, "TP3 at (R) - closes the rest", minval=0.1, step=0.1, group=grpT)
+showTradeLabels = input.bool(true, "Label entry, stop and targets on the chart", group=grpT)
 
 grpZ = "Zone handling (order blocks and FVGs)"
 zoneMaxAge = input.int(200, "Zone max age (bars)", minval=10, group=grpZ)
@@ -526,6 +567,15 @@ if orbLong
 if orbShort
     orbShortDone := true
 
+// -------------------------------------------------- VWAP 8. EMA/VWAP cross
+// The CROSS is the event. "EMA above VWAP" is a state that stays true for
+// hours, and a state in this vote counter is the mistake the trend slot was
+// removed for. ta.vwap resets each session, so this is an intraday reading.
+vwapVal = ta.vwap
+emaVal = ta.ema(close, emaLen)
+evLong  = useEmaVwap and ta.crossover(emaVal, vwapVal)
+evShort = useEmaVwap and ta.crossunder(emaVal, vwapVal)
+
 // ------------------------------------------------- contribution counters
 // "Did this strategy do anything?" is a question the chart should answer
 // rather than one you discover by toggling a switch and squinting at a
@@ -546,6 +596,7 @@ sweepFired = sweepLong or sweepShort
 obFired    = obLong    or obShort
 fvFired    = fvLong    or fvShort
 orbFired   = orbLong   or orbShort
+evFired    = evLong    or evShort
 
 var int nBrk = 0
 var int nBos = 0
@@ -554,6 +605,7 @@ var int nSweep = 0
 var int nOb = 0
 var int nFv = 0
 var int nOrb = 0
+var int nEv = 0
 var int sBrk = 0
 var int sBos = 0
 var int sSr = 0
@@ -561,6 +613,7 @@ var int sSweep = 0
 var int sOb = 0
 var int sFv = 0
 var int sOrb = 0
+var int sEv = 0
 
 if barstate.isconfirmed
     if brkFired
@@ -585,6 +638,9 @@ if barstate.isconfirmed
         nOrb += 1
         // Sole member of its family, so every fire is a solo fire.
         sOrb += 1
+    if evFired
+        nEv += 1
+        sEv += 1
 
 // ------------------------------------------------- fakeout control gates
 // Displacement: an institutional break leaves a body, a drift across the
@@ -645,16 +701,18 @@ zoneLong   = obLong  or fvLong
 zoneShort  = obShort or fvShort
 sessLong   = orbLong
 sessShort  = orbShort
+vwapLong   = evLong
+vwapShort  = evShort
 
 // ------------------------------------------------------------- votes
 // Per family when capped, per strategy when not. Uncapped is offered to
 // show what the difference costs, not because it is a reasonable setting:
 // correlated signals derived from one set of pivots make the filter looser
 // the more of them you enable.
-longVotesCapped  = (structLong  ? 1 : 0) + (rejLong  ? 1 : 0) + (zoneLong  ? 1 : 0) + (sessLong  ? 1 : 0)
-shortVotesCapped = (structShort ? 1 : 0) + (rejShort ? 1 : 0) + (zoneShort ? 1 : 0) + (sessShort ? 1 : 0)
-longVotesRaw  = (brkLong  ? 1 : 0) + (bosLong  ? 1 : 0) + (srLong  ? 1 : 0) + (sweepLong  ? 1 : 0) + (obLong  ? 1 : 0) + (fvLong  ? 1 : 0) + (orbLong  ? 1 : 0)
-shortVotesRaw = (brkShort ? 1 : 0) + (bosShort ? 1 : 0) + (srShort ? 1 : 0) + (sweepShort ? 1 : 0) + (obShort ? 1 : 0) + (fvShort ? 1 : 0) + (orbShort ? 1 : 0)
+longVotesCapped  = (structLong  ? 1 : 0) + (rejLong  ? 1 : 0) + (zoneLong  ? 1 : 0) + (sessLong  ? 1 : 0) + (vwapLong  ? 1 : 0)
+shortVotesCapped = (structShort ? 1 : 0) + (rejShort ? 1 : 0) + (zoneShort ? 1 : 0) + (sessShort ? 1 : 0) + (vwapShort ? 1 : 0)
+longVotesRaw  = (brkLong  ? 1 : 0) + (bosLong  ? 1 : 0) + (srLong  ? 1 : 0) + (sweepLong  ? 1 : 0) + (obLong  ? 1 : 0) + (fvLong  ? 1 : 0) + (orbLong  ? 1 : 0) + (evLong  ? 1 : 0)
+shortVotesRaw = (brkShort ? 1 : 0) + (bosShort ? 1 : 0) + (srShort ? 1 : 0) + (sweepShort ? 1 : 0) + (obShort ? 1 : 0) + (fvShort ? 1 : 0) + (orbShort ? 1 : 0) + (evShort ? 1 : 0)
 longVotes  = capFamilies ? longVotesCapped  : longVotesRaw
 shortVotes = capFamilies ? shortVotesCapped : shortVotesRaw
 
@@ -675,6 +733,8 @@ else if orbLong and not na(orbHigh)
     longLevel := orbHigh
 else if structLong and not na(structLevelLong)
     longLevel := structLevelLong
+else if evLong and not na(vwapVal)
+    longLevel := vwapVal
 
 float shortLevel = na
 if obShort
@@ -687,6 +747,8 @@ else if orbShort and not na(orbLow)
     shortLevel := orbLow
 else if structShort and not na(structLevelShort)
     shortLevel := structLevelShort
+else if evShort and not na(vwapVal)
+    shortLevel := vwapVal
 
 // ------------------------------------------------------------ entries
 flat = strategy.position_size == 0
@@ -734,6 +796,9 @@ if strategy.position_size != 0
 // ----------------------------------------------------- stop management
 var float stopLevel = na
 var float entryR = na
+var float tp1 = na
+var float tp2 = na
+var float tp3 = na
 var bool beLocked = false
 var float runExtreme = na
 
@@ -750,6 +815,21 @@ if justOpened
     entryR := math.abs(entryPrice - stopLevel)
     beLocked := false
     runExtreme := isLong ? high : low
+    tp1 := isLong ? entryPrice + tp1R * entryR : entryPrice - tp1R * entryR
+    tp2 := isLong ? entryPrice + tp2R * entryR : entryPrice - tp2R * entryR
+    tp3 := isLong ? entryPrice + tp3R * entryR : entryPrice - tp3R * entryR
+    if showTradeLabels
+        label.new(bar_index, isLong ? low : high,
+             (isLong ? "LONG " : "SHORT ") + str.tostring(entryPrice, format.mintick) +
+             "\nSL " + str.tostring(stopLevel, format.mintick) +
+             (useScaledExit ?
+                  "\nTP1 " + str.tostring(tp1, format.mintick) +
+                  "\nTP2 " + str.tostring(tp2, format.mintick) +
+                  "\nTP3 " + str.tostring(tp3, format.mintick)
+                : takeProfitR > 0 ? "\nTP " + str.tostring(isLong ? entryPrice + takeProfitR * entryR : entryPrice - takeProfitR * entryR, format.mintick) : ""),
+             style = isLong ? label.style_label_up : label.style_label_down,
+             color = color.new(isLong ? color.teal : color.maroon, 20),
+             textcolor = color.white, size = size.small)
 
 if strategy.position_size > 0
     runExtreme := na(runExtreme) ? high : math.max(runExtreme, high)
@@ -762,7 +842,14 @@ if strategy.position_size > 0
         stopLevel := math.max(nz(stopLevel, entryPrice), runExtreme - trailAtrMult * atr)
     tpLong = takeProfitR > 0 and not na(entryR) ? entryPrice + takeProfitR * entryR : na
     if not na(stopLevel)
-        strategy.exit("L-x", from_entry="L", stop=stopLevel, limit=tpLong, alert_message=alertMsg("exit"))
+        if not useScaledExit
+            strategy.exit("L-x", from_entry="L", stop=stopLevel, limit=tpLong, alert_message=alertMsg("exit"))
+        else
+            // Each leg carries the stop, so the runner is never left
+            // unprotected once the earlier legs have filled.
+            strategy.exit("L-tp1", from_entry="L", qty_percent=tp1Pct, stop=stopLevel, limit=tp1, alert_message=alertMsg("exit"))
+            strategy.exit("L-tp2", from_entry="L", qty_percent=tp2Pct, stop=stopLevel, limit=tp2, alert_message=alertMsg("exit"))
+            strategy.exit("L-tp3", from_entry="L", stop=stopLevel, limit=tp3, alert_message=alertMsg("exit"))
 
 if strategy.position_size < 0
     runExtreme := na(runExtreme) ? low : math.min(runExtreme, low)
@@ -774,7 +861,12 @@ if strategy.position_size < 0
         stopLevel := math.min(nz(stopLevel, entryPrice), runExtreme + trailAtrMult * atr)
     tpShort = takeProfitR > 0 and not na(entryR) ? entryPrice - takeProfitR * entryR : na
     if not na(stopLevel)
-        strategy.exit("S-x", from_entry="S", stop=stopLevel, limit=tpShort, alert_message=alertMsg("exit"))
+        if not useScaledExit
+            strategy.exit("S-x", from_entry="S", stop=stopLevel, limit=tpShort, alert_message=alertMsg("exit"))
+        else
+            strategy.exit("S-tp1", from_entry="S", qty_percent=tp1Pct, stop=stopLevel, limit=tp1, alert_message=alertMsg("exit"))
+            strategy.exit("S-tp2", from_entry="S", qty_percent=tp2Pct, stop=stopLevel, limit=tp2, alert_message=alertMsg("exit"))
+            strategy.exit("S-tp3", from_entry="S", stop=stopLevel, limit=tp3, alert_message=alertMsg("exit"))
 
 if strategy.position_size == 0 and strategy.position_size[1] != 0
     stopLevel := na
@@ -782,6 +874,9 @@ if strategy.position_size == 0 and strategy.position_size[1] != 0
     beLocked := false
     runExtreme := na
     plannedStop := na
+    tp1 := na
+    tp2 := na
+    tp3 := na
 
 // -------------------------------------------------------------- plots
 plot(useBreakout ? rangeHigh : na, "Range high", color=color.new(color.gray, 50), style=plot.style_linebr)
@@ -799,6 +894,12 @@ plot(useOrb ? orbLow : na, "ORB low", color=color.new(color.purple, 20), style=p
 // A break waiting out its hold. Visible because "why is there no signal
 // on that obvious break" should be answerable from the chart.
 plotchar(not na(armBar), "Break on hold", "·", location.top, color.new(color.aqua, 30), size=size.tiny)
+plot(useEmaVwap ? vwapVal : na, "VWAP", color=color.new(color.white, 40), style=plot.style_linebr)
+plot(useEmaVwap ? emaVal : na, "EMA", color=color.new(color.yellow, 40), style=plot.style_linebr)
+inTrade = strategy.position_size != 0
+plot(inTrade and useScaledExit ? tp1 : na, "TP1", color=color.new(color.lime, 40), style=plot.style_linebr)
+plot(inTrade and useScaledExit ? tp2 : na, "TP2", color=color.new(color.lime, 55), style=plot.style_linebr)
+plot(inTrade and useScaledExit ? tp3 : na, "TP3", color=color.new(color.lime, 70), style=plot.style_linebr)
 
 // A signal whose retest price was already through the market is skipped
 // rather than filled at the market. Marked, because a triangle with no
@@ -827,7 +928,7 @@ statCell(table t, int r, int fired, int solo, bool on) =>
     col = not on ? color.new(color.gray, 65) : solo == 0 and fired > 0 ? color.orange : color.gray
     table.cell(t, 2, r, txt, text_size=size.tiny, text_color=col)
 
-var table votes = table.new(position.top_right, 3, 13, border_width=1)
+var table votes = table.new(position.top_right, 3, 15, border_width=1)
 if barstate.islast
     table.cell(votes, 0, 0, "Family / strategy", text_size=size.tiny, text_color=color.white)
     table.cell(votes, 1, 0, str.tostring(longVotes) + "L / " + str.tostring(shortVotes) + "S",
@@ -851,8 +952,11 @@ if barstate.islast
     voteCell(votes, 10, "SESSION", sessLong, sessShort, useOrb)
     voteCell(votes, 11, "  opening range", orbLong, orbShort, useOrb)
     statCell(votes, 11, nOrb, sOrb, useOrb)
-    table.cell(votes, 0, 12, "Need", text_size=size.tiny, text_color=color.gray)
-    table.cell(votes, 1, 12, str.tostring(minConfirmations) + (capFamilies ? " of 4 families" : " uncapped") +
+    voteCell(votes, 12, "VWAP", vwapLong, vwapShort, useEmaVwap)
+    voteCell(votes, 13, "  EMA/VWAP cross", evLong, evShort, useEmaVwap)
+    statCell(votes, 13, nEv, sEv, useEmaVwap)
+    table.cell(votes, 0, 14, "Need", text_size=size.tiny, text_color=color.gray)
+    table.cell(votes, 1, 14, str.tostring(minConfirmations) + (capFamilies ? " of 5 families" : " uncapped") +
          (useTrailing or takeProfitR > 0 ? "" : "  NO EXIT") +
          (holdBars > 0 ? "  hold " + str.tostring(holdBars) : ""),
          text_size=size.tiny, text_color=useTrailing or takeProfitR > 0 ? color.gray : color.red)
