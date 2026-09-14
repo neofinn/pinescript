@@ -132,26 +132,15 @@ def leg_walk(sym, t, struct, days_index):
                 span_legs.append(dict(kind="opt", ot=ot, qty=q, strike=k, premium=pin,
                                       iv=SPAN.leg_iv(spot, k, yrs, ot, pin)))
             margin = SPAN.span_margin(spot, span_legs, yrs)
-            # per-lot worst case for this structure, in index points
-            stop_move = t["r0"]                       # 3x ATR, the signal's own stop
-            if fq and not opts:                       # futures
-                max_loss = stop_move
-            elif fq:                                  # futures + option hedge
-                puts=[w for w in widths if w[0]=="PE"]
-                if puts:
-                    kp=puts[0][2]
-                    max_loss = min(stop_move, max(0.0, spot-kp) + debit - credit)
-                else:
-                    max_loss = max(1e-9, stop_move - credit)
-            elif len(opts)==1 and opts[0][2]>0:       # long option
-                max_loss = debit
-            elif len(opts)==1:                        # naked short
-                max_loss = stop_move - credit
-            else:                                     # vertical spread
-                ks=[w[2] for w in widths]
-                width=abs(ks[0]-ks[1])
-                max_loss = (debit-credit) if debit>credit else (width-(credit-debit))
-            max_loss = max(max_loss, 1e-9)
+            # Risk is what THIS structure loses if the signal's own stop is hit,
+            # evaluated through its legs. One rule for every structure: a future
+            # loses the full stop distance, a long option cannot lose more than
+            # its premium, and a collar is capped by its put. Sizing each
+            # structure by its own hand-derived formula invited exactly the
+            # artefact that a near-zero collar risk produced.
+            adverse = -abs(t["r0"]) / spot
+            max_loss = -SPAN.revalue(spot, span_legs, yrs, adverse, 0.0)
+            max_loss = max(max_loss, spot * 0.0005)
         if close_on>=exitd: break
         nxt=[x for x in days_index if x>close_on]
         if not nxt or nxt[0]>exitd: break
@@ -180,7 +169,11 @@ def simulate(sigs, days_index, capital, name):
         marg_per_lot = r["margin"]*r["lot"]
         if risk_per_lot<=0: skipped+=1; continue
         lots=int((eq*RISK_FRAC)//risk_per_lot)
-        while lots>0 and marg_per_lot*lots>free: lots-=1
+        # Bound by available margin directly. Decrementing one lot at a time
+        # hangs for any structure whose risk estimate is small enough to make
+        # the initial lot count enormous.
+        if marg_per_lot > 0:
+            lots = min(lots, int(free // marg_per_lot))
         if lots<1: skipped+=1; continue
         pnl=r["points"]*r["lot"]*lots
         eq+=pnl; free=eq; taken+=1
