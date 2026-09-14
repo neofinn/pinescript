@@ -25,18 +25,36 @@ def px(d, sym, ot, exp, strike):
             return (p if p > 0 else None), r["traded"]
     return None, False
 
-def atm(d, sym, ot, exp, spot):
-    """Nearest strike to spot that actually traded that day."""
+def atm(d, sym, ot, exp, spot, offset=0):
+    """Strike `offset` steps out of the money from ATM, among strikes that
+    actually traded. Offset walks up the ladder for calls and down for puts,
+    by position rather than a fixed point step, since NIFTY's spacing widens
+    away from the money and has changed over the years."""
     c = [r for r in F.chain(d, sym, ot, exp) if r["traded"] and r["close"] > 0]
     if not c: return None
-    return min(c, key=lambda r: abs(r["strike"] - spot))["strike"]
+    ks = sorted({r["strike"] for r in c})
+    i = min(range(len(ks)), key=lambda j: abs(ks[j] - spot))
+    j = i + offset if ot == "CE" else i - offset
+    if j < 0 or j >= len(ks): return None
+    return ks[j]
+
+def oi_at(d, sym, ot, exp, strike):
+    for r in F.chain(d, sym, ot, exp):
+        if abs(r["strike"] - strike) < 1e-6: return r["oi"]
+    return 0.0
+
+def chain_oi(d, sym, exp):
+    """(call OI, put OI) across the whole expiry -- the basis for PCR."""
+    ce = sum(r["oi"] for r in F.chain(d, sym, "CE", exp))
+    pe = sum(r["oi"] for r in F.chain(d, sym, "PE", exp))
+    return ce, pe
 
 def pick_exp(d, sym, min_days=7):
     for e in F.monthly_expiries(d, sym):
         if (e - d).days >= min_days: return e
     return None
 
-def leg(entry, exitd, ot, sym="NIFTY", verbose=False):
+def leg(entry, exitd, ot, sym="NIFTY", verbose=False, offset=0):
     """Walk the position, rolling at each expiry. Returns % return on premium."""
     cur, legs, settle_used = entry, [], 0
     guard = 0
@@ -46,7 +64,7 @@ def leg(entry, exitd, ot, sym="NIFTY", verbose=False):
         if exp is None: return None, "no expiry", 0
         spot = SPOT.get(cur)
         if spot is None: return None, "no spot", 0
-        k = atm(cur, sym, ot, exp, spot)
+        k = atm(cur, sym, ot, exp, spot, offset)
         if k is None: return None, f"no ATM {cur}", 0
         pin, tr_in = px(cur, sym, ot, exp, k)
         if pin is None: return None, f"no entry px {cur}", 0
