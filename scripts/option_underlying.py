@@ -36,17 +36,17 @@ def stock_spot_series():
 
 SPOTS = stock_spot_series()
 
-def leg_stock(sym, entry, exitd, ot):
+def leg_stock(sym, entry, exitd, ot, offset=0, min_days=7):
     """Same roll walk as the index leg, against this stock's own chain."""
     sp = SPOTS.get(sym, {})
     cur, legs, settle_used, guard = entry, [], 0, 0
     while cur < exitd and guard < 12:
         guard += 1
-        exp = O.pick_exp(cur, sym)
+        exp = O.pick_exp(cur, sym, min_days)
         if exp is None: return None, "no expiry", 0
         spot = sp.get(cur)
         if spot is None: return None, "no spot", 0
-        k = O.atm(cur, sym, ot, exp, spot)
+        k = O.atm(cur, sym, ot, exp, spot, offset)
         if k is None: return None, "no ATM", 0
         pin, tr = O.px(cur, sym, ot, exp, k)
         if pin is None or pin <= 0: return None, "no entry px", 0

@@ -54,13 +54,13 @@ def pick_exp(d, sym, min_days=7):
         if (e - d).days >= min_days: return e
     return None
 
-def leg(entry, exitd, ot, sym="NIFTY", verbose=False, offset=0):
+def leg(entry, exitd, ot, sym="NIFTY", verbose=False, offset=0, min_days=7):
     """Walk the position, rolling at each expiry. Returns % return on premium."""
     cur, legs, settle_used = entry, [], 0
     guard = 0
     while cur < exitd and guard < 12:
         guard += 1
-        exp = pick_exp(cur, sym)
+        exp = pick_exp(cur, sym, min_days)
         if exp is None: return None, "no expiry", 0
         spot = SPOT.get(cur)
         if spot is None: return None, "no spot", 0
