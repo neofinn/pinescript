@@ -16,7 +16,7 @@ from datetime import datetime
 from .clock import now_ns
 from .engine import Engine
 from .risk import RiskGate
-from .session import SessionWindow, Phase, IST
+from .session import TradingDay, Phase, IST
 from .signals import OptionSignal
 from .adapters.sim import SimFeed, SimGateway
 
@@ -46,11 +46,11 @@ async def run_sim(seconds: float, lag_ms: float, fill_prob: float,
     # 200 delta is under two NIFTY lots. Sized for the instrument, not a
     # round number: 75 per lot at ~0.5 delta is 37 delta a lot.
     risk = RiskGate(max_pos_lots=10, max_orders=400, orders_per_sec=8.0,
-                    max_net_delta=750.0)
+                    max_net_delta=750.0, profit_goal=0.0)
     sigs = [OptionSignal(c["token"], c["strike"], c["is_call"], IV, LOT, TICK,
                          min_edge_ticks=min_edge_ticks)
             for c in contracts]
-    win = SessionWindow(warmup_s=0, active_s=int(seconds), flatten_s=1)
+    win = TradingDay(warmup_s=0)
     eng = Engine(U, sigs, risk, gw, win, T)
     feed.set_handler(eng.on_tick)
 
@@ -61,6 +61,8 @@ async def run_sim(seconds: float, lag_ms: float, fill_prob: float,
         while True:
             for (tok, side, lots, px) in eng.drain():
                 await gw.send(tok, side, lots, px)
+            # off the tick path, and only while flat
+            eng.maintenance(eng.flat())
             await asyncio.sleep(0.002)
 
     d = asyncio.create_task(drain())

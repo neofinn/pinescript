@@ -17,7 +17,7 @@ from datetime import datetime
 from .clock import now_ns
 from .engine import Engine
 from .risk import RiskGate
-from .session import SessionWindow, Phase, IST
+from .session import TradingDay, Phase, IST
 from .signals import OptionSignal
 from .pricing import implied_vol
 
@@ -154,14 +154,18 @@ async def run(args) -> int:
                     max_net_delta=args.lot * 0.6 * max_lots * 2,
                     max_order_value=atm_prem * args.lot * max_lots * 1.5,
                     max_orders=args.max_orders,
-                    max_daily_loss=args.capital * 0.02,
-                    orders_per_sec=args.orders_per_sec)
-    win = SessionWindow(warmup_s=args.warmup, active_s=args.active, flatten_s=60)
+                    max_daily_loss=args.capital * args.loss_pct / 100.0,
+                    orders_per_sec=args.orders_per_sec,
+                    profit_goal=args.capital * args.goal_pct / 100.0)
+    win = TradingDay(warmup_s=args.warmup, flat_hhmm=tuple(
+        int(x) for x in args.flat_at.split(":")))
     eng = Engine(1, sigs, risk, None, win, t_years)
 
     print(f"\nRISK GATE  max_lots={max_lots}  max_delta={risk.max_net_delta:.0f}  "
           f"max_loss={risk.max_daily_loss:,.0f}  orders/s={args.orders_per_sec}")
-    print(f"WINDOW     warmup {args.warmup}s, active {args.active}s, then flat")
+    print(f"DAY        armed from the open until {args.flat_at}, then squared off")
+    print(f"GOAL       +{risk.profit_goal:,.0f} disarms for the day  |  "
+          f"LOSS -{risk.max_daily_loss:,.0f} kills")
     print(f"MODE       {'LIVE ORDERS' if args.live else 'PAPER (no orders sent)'}")
     if args.live:
         print("\n  --live is declared but no Gateway is wired. Implement\n"
@@ -183,8 +187,14 @@ def main() -> int:
     p.add_argument("--strikes", type=int, default=5)
     p.add_argument("--edge-ticks", type=float, default=3.0)
     p.add_argument("--warmup", type=int, default=20)
-    p.add_argument("--active", type=int, default=300)
-    p.add_argument("--max-orders", type=int, default=40)
+    p.add_argument("--flat-at", default="15:10",
+                   help="square off at this IST time; brokers auto-square later at their price")
+    p.add_argument("--goal-pct", type=float, default=1.0,
+                   help="stop opening new risk once up this %% of capital")
+    p.add_argument("--loss-pct", type=float, default=2.0,
+                   help="kill the day at this %% of capital")
+    p.add_argument("--max-orders", type=int, default=600,
+                   help="sized for a full session, not a five minute window")
     p.add_argument("--orders-per-sec", type=float, default=5.0)
     p.add_argument("--live", action="store_true",
                    help="send real orders (needs a Gateway; refuses without one)")

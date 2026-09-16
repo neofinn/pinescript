@@ -1,7 +1,8 @@
 # Opening-window options HFT
 
-Time-boxed to the first minutes of the session. Arms at the open, trades a
-defined window, flattens and stays down for the day.
+Runs the whole session. There is no trading window: the strategy scalps quote
+lag, and lag exists whenever the market is open. What bounds the day is a profit
+goal, a loss limit, and the bell.
 
 ## The strategy
 
@@ -30,7 +31,7 @@ Two guards matter more than the signal:
 | `pricing.py` | Black-Scholes via `erf`, bisection IV off the hot path |
 | `signals.py` | fair-value deviation, momentum guard |
 | `risk.py` | pre-trade gate, fails closed, every rejection counted |
-| `session.py` | WARMUP / ACTIVE / FLATTEN phases, absolute deadline |
+| `session.py` | market-hours phases, mandatory squaring-off before the close |
 | `engine.py` | the tick path |
 | `adapters/base.py` | Feed and Gateway protocols — implement for your venue |
 | `adapters/sim.py` | simulator that reproduces quote lag and pessimistic fills |
@@ -46,13 +47,34 @@ Read the latency histogram first. If `tick->signal` is not comfortably inside
 your quote-lag assumption, the strategy cannot take the lag it is aiming at and
 no amount of tuning the edge threshold fixes that.
 
+## How the day ends
+
+Three ways, and they are not the same:
+
+- **Profit goal → disarm.** Stops opening new risk; the open book can still be
+  closed. Set with `--goal-pct`.
+- **Loss limit → kill.** One way. Set with `--loss-pct`.
+- **The bell → flatten.** Not optional. An intraday option carried past the
+  close becomes an overnight gap position, and Indian brokers auto-square
+  intraday books around 15:15-15:25 at their price. Squaring off deliberately
+  at 15:10 is strictly better than being squared off.
+
+State checks sit above the throttles in the risk gate on purpose. A goal
+reported as a rate-limit rejection is a goal you never learn you hit.
+
 ## Hot path rules
 
 - No allocation. Books, signals and the histogram are built once and mutated.
 - No logging. Records go to a pre-sized ring, drained after the window.
 - No awaits. Orders queue in the tick path; a separate loop ships them, so the
   broker round trip does not land on the latency of every following tick.
-- `gc.freeze()` then `gc.disable()` for the window, restored on exit.
+- `gc.freeze()` then `gc.disable()`, with a gen-0 pass on a slow cadence and
+  only while flat. Disabling the collector for five minutes is free; leaving it
+  off for six hours is not, because the drain list, the order layer and the feed
+  all allocate even though the tick path does not.
+- The signal log is a **ring**. Sized for a short window it would simply fill;
+  over a full session a non-wrapping buffer stops recording minutes in and every
+  later signal vanishes without a trace.
 
 ## What the simulator is and is not
 

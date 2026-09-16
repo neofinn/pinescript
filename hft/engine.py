@@ -47,9 +47,15 @@ class Engine:
         self.tick_to_send = LatencyHistogram("tick->send")
         self._phase = Phase.PRE
         self._pending: list[tuple] = []          # drained by the async sender
-        self._log = [None] * log_size            # pre-allocated
+        # A ring, not a buffer that fills and stops. Sized for a five minute
+        # window it would simply fill; running all day it would stop recording
+        # a few minutes in and every later signal would vanish silently.
+        self._log = [None] * log_size
         self._log_i = 0
+        self._log_n = 0                          # total ever written
         self._ticks = 0
+        self._last_gc_ns = 0
+        self._gc_every_ns = 5_000_000_000        # 5s, only ever while flat
         # Position per token, and delta recomputed FROM it. Accumulating a
         # running delta off intended orders is a one-way ratchet: it never
         # reconciles against what actually filled, so it drifts up until the
@@ -59,9 +65,28 @@ class Engine:
     # ── lifecycle ──────────────────────────────────────────────────────────
     def enter_window(self) -> None:
         gc.collect()
-        gc.freeze()            # move everything live into the permanent gen
-        gc.disable()           # no collection pauses inside the window
+        gc.freeze()            # everything live now moves to the permanent gen
+        gc.disable()           # no automatic pauses on the tick path
+        self._last_gc_ns = now_ns()
         self.risk.arm()
+
+    def maintenance(self, flat: bool) -> bool:
+        """Collect generation 0, but only while flat and only off the tick path.
+
+        Disabling the collector for a five minute window is free. Leaving it off
+        for a six hour session is not: the tick path allocates nothing, but the
+        drain list, the order layer and the feed all do, and none of it is ever
+        reclaimed. A gen-0 pass is tens of microseconds and it runs while there
+        is no position to be slow about.
+        """
+        if not flat:
+            return False
+        t = now_ns()
+        if t - self._last_gc_ns < self._gc_every_ns:
+            return False
+        gc.collect(0)
+        self._last_gc_ns = now_ns()
+        return True
 
     def leave_window(self) -> None:
         self.risk.disarm()
@@ -133,9 +158,9 @@ class Engine:
 
     def _record(self, ts_ns: int, token: int, side: int, px: float,
                 edge: float, verdict: int) -> None:
-        if self._log_i < len(self._log):
-            self._log[self._log_i] = (ts_ns, token, side, px, edge, verdict)
-            self._log_i += 1
+        self._log[self._log_i] = (ts_ns, token, side, px, edge, verdict)
+        self._log_i = (self._log_i + 1) % len(self._log)
+        self._log_n += 1
 
     # ── drained off the hot path ───────────────────────────────────────────
     def drain(self) -> list[tuple]:
@@ -148,12 +173,19 @@ class Engine:
     def set_phase(self, p: Phase) -> None:
         self._phase = p
 
+    def flat(self) -> bool:
+        return not any(self._pos.values())
+
     def stats(self) -> str:
         u = self.books[self.u_token]
-        return (f"ticks={self._ticks} signals={self._log_i} "
+        return (f"ticks={self._ticks} signals={self._log_n} "
                 f"net_delta={self._net_delta(u.micro):+.0f} | {self.risk.summary()}\n"
                 f"  {self.tick_to_signal.summary()}\n"
                 f"  {self.tick_to_send.summary()}")
 
     def trade_log(self) -> list[tuple]:
-        return [r for r in self._log[:self._log_i] if r]
+        """Oldest first. Callers should drain periodically on a long run --
+        the ring holds the last log_size entries and overwrites beyond that."""
+        if self._log_n < len(self._log):
+            return [r for r in self._log[:self._log_i] if r]
+        return [r for r in self._log[self._log_i:] + self._log[:self._log_i] if r]

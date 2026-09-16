@@ -1,18 +1,24 @@
-"""Time-boxing. The bot is armed for a defined window and dead outside it.
+"""Session phases for a strategy that runs all day.
 
-Three phases rather than two, because the first seconds after 9:15:00 are not
-tradeable: NSE runs a pre-open call auction to 9:08 and the continuous session
-opens at 9:15, but the book in the first moments is thin and quotes are being
-established rather than quoted. Trading that is not an edge, it is paying to
-discover the price for everyone else.
+There is no trading window in the strategy sense -- the bot scalps quote lag
+whenever lag exists, which is whenever the market is open. What remains is the
+structure the exchange imposes.
 
-  WARMUP   collect ticks, build books, solve IV. No orders.
-  ACTIVE   armed. Orders permitted.
-  FLATTEN  hard stop. Cancel everything, close everything, disarm, stay down.
+  PRE      before the open. No orders.
+  WARMUP   books filling, IV not yet solved. No orders.
+  ACTIVE   armed, for as long as the market is open.
+  FLATTEN  before the close. Cancel, square off, stay down.
+  DONE
 
-The flatten deadline is absolute and checked on every tick, not scheduled. A
-scheduled callback that a busy loop starves is how a position survives past the
-window it was supposed to die in.
+The flatten phase is not optional and is not a preference. An intraday option
+position carried past the bell becomes an overnight gap position, and Indian
+brokers auto-square intraday books around 15:15-15:25 anyway -- at their price,
+not yours. Squaring off deliberately, early, is strictly better than being
+squared off.
+
+The deadline is checked on every tick rather than scheduled, because a scheduled
+callback that a busy loop starves is how a position survives the bell it was
+supposed to die at.
 """
 from __future__ import annotations
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -29,40 +35,43 @@ class Phase(IntEnum):
     DONE = 4
 
 
-class SessionWindow:
-    __slots__ = ("open_t", "warmup_s", "active_s", "flatten_s", "_phase", "_date")
+class TradingDay:
+    """Market hours with a mandatory squaring-off phase before the close."""
 
-    def __init__(self, open_hhmm: tuple[int, int] = (9, 15), warmup_s: int = 20,
-                 active_s: int = 300, flatten_s: int = 60) -> None:
-        self.open_t = dtime(open_hhmm[0], open_hhmm[1], 0)
+    __slots__ = ("open_t", "close_t", "flat_t", "warmup_s")
+
+    def __init__(self, open_hhmm: tuple[int, int] = (9, 15),
+                 flat_hhmm: tuple[int, int] = (15, 10),
+                 close_hhmm: tuple[int, int] = (15, 30),
+                 warmup_s: int = 20) -> None:
+        self.open_t = dtime(*open_hhmm)
+        self.flat_t = dtime(*flat_hhmm)
+        self.close_t = dtime(*close_hhmm)
         self.warmup_s = warmup_s
-        self.active_s = active_s
-        self.flatten_s = flatten_s
-        self._phase = Phase.PRE
-        self._date = None
-
-    def _anchor(self, now: datetime) -> datetime:
-        return now.replace(hour=self.open_t.hour, minute=self.open_t.minute,
-                           second=0, microsecond=0)
 
     def phase(self, now: datetime | None = None) -> Phase:
         now = now or datetime.now(IST)
         if now.weekday() >= 5:
             return Phase.DONE
-        a = self._anchor(now)
-        if now < a:
+        t = now.time()
+        if t < self.open_t:
             return Phase.PRE
-        elapsed = (now - a).total_seconds()
-        if elapsed < self.warmup_s:
-            return Phase.WARMUP
-        if elapsed < self.warmup_s + self.active_s:
-            return Phase.ACTIVE
-        if elapsed < self.warmup_s + self.active_s + self.flatten_s:
+        if t >= self.close_t:
+            return Phase.DONE
+        if t >= self.flat_t:
             return Phase.FLATTEN
-        return Phase.DONE
+        anchor = now.replace(hour=self.open_t.hour, minute=self.open_t.minute,
+                             second=0, microsecond=0)
+        if (now - anchor).total_seconds() < self.warmup_s:
+            return Phase.WARMUP
+        return Phase.ACTIVE
 
-    def seconds_left(self, now: datetime | None = None) -> float:
+    def seconds_to_flat(self, now: datetime | None = None) -> float:
         now = now or datetime.now(IST)
-        a = self._anchor(now)
-        end = a + timedelta(seconds=self.warmup_s + self.active_s)
-        return max(0.0, (end - now).total_seconds())
+        f = now.replace(hour=self.flat_t.hour, minute=self.flat_t.minute,
+                        second=0, microsecond=0)
+        return max(0.0, (f - now).total_seconds())
+
+
+# kept so existing imports do not break
+SessionWindow = TradingDay

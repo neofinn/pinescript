@@ -19,6 +19,7 @@ class Reject(IntEnum):
     NOT_ARMED = 2
     RATE_LIMIT = 3
     MAX_ORDERS = 4
+    GOAL_REACHED = 11
     POSITION_LIMIT = 5
     NET_DELTA_LIMIT = 6
     ORDER_VALUE = 7
@@ -30,6 +31,7 @@ class Reject(IntEnum):
 class RiskGate:
     __slots__ = ("killed", "armed", "max_pos_lots", "max_net_delta",
                  "max_order_value", "max_orders", "max_daily_loss",
+                 "profit_goal", "goal_hit",
                  "orders_sent", "realised", "unrealised", "_tokens",
                  "_token_rate", "_token_cap", "_last_refill_ns",
                  "_pos", "_last_by_token", "_min_gap_ns", "reject_counts")
@@ -37,7 +39,7 @@ class RiskGate:
     def __init__(self, max_pos_lots: int = 10, max_net_delta: float = 200.0,
                  max_order_value: float = 500_000.0, max_orders: int = 400,
                  max_daily_loss: float = 25_000.0, orders_per_sec: float = 8.0,
-                 min_gap_us: int = 20_000) -> None:
+                 min_gap_us: int = 20_000, profit_goal: float = 0.0) -> None:
         self.killed = False
         self.armed = False
         self.max_pos_lots = max_pos_lots
@@ -45,6 +47,11 @@ class RiskGate:
         self.max_order_value = max_order_value
         self.max_orders = max_orders
         self.max_daily_loss = max_daily_loss
+        # A goal DISARMS, a loss KILLS. Different outcomes on purpose: hitting
+        # the target should stop new risk while still allowing the open book to
+        # be closed, whereas a loss limit means stop touching anything.
+        self.profit_goal = profit_goal
+        self.goal_hit = False
         self.orders_sent = 0
         self.realised = 0.0
         self.unrealised = 0.0
@@ -93,6 +100,19 @@ class RiskGate:
         if not self.armed:
             return self._rej(Reject.NOT_ARMED)
 
+        # State checks come before throttles. A goal that is reported as a
+        # rate-limit rejection is a goal you never find out you hit -- the
+        # counter shows thousands of RATE_LIMITs and the real reason is buried.
+        if self.profit_goal > 0.0 and self.pnl() >= self.profit_goal:
+            if not self.goal_hit:
+                self.goal_hit = True
+                self.armed = False
+            return self._rej(Reject.GOAL_REACHED)
+
+        if self.pnl() < -self.max_daily_loss:
+            self.kill("daily loss")
+            return self._rej(Reject.DAILY_LOSS)
+
         t = now_ns()
         if t - self._last_by_token.get(token, 0) < self._min_gap_ns:
             return self._rej(Reject.RATE_LIMIT)
@@ -122,10 +142,6 @@ class RiskGate:
         if abs(net_delta) > self.max_net_delta:
             return self._rej(Reject.NET_DELTA_LIMIT)
 
-        if self.pnl() < -self.max_daily_loss:
-            self.kill("daily loss")
-            return self._rej(Reject.DAILY_LOSS)
-
         # only spend the token once the order is actually going out
         self._tokens -= 1.0
         self._last_by_token[token] = t
@@ -140,4 +156,5 @@ class RiskGate:
         parts = [f"{Reject(i).name}={c}" for i, c in enumerate(self.reject_counts)
                  if c and i != 0]
         return (f"orders={self.orders_sent} pnl={self.pnl():+.0f} "
-                f"killed={self.killed} rejects[{' '.join(parts) or 'none'}]")
+                f"killed={self.killed} goal_hit={self.goal_hit} "
+                f"rejects[{' '.join(parts) or 'none'}]")
