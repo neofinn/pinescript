@@ -109,6 +109,45 @@ def print_breakeven(fee: float, capture: float) -> None:
     print()
 
 
+def print_rate_reality(target_ops: float, fee: float,
+                       signal_per_contract_per_s: float) -> None:
+    """What a 40-orders-per-second target runs into before any P&L question.
+
+    The caps are Zerodha Kite Connect's published ones, checked 2026-09. Other
+    brokers differ -- Dhan and Angel publish higher per-second numbers -- but
+    all of them carry a per-MINUTE and per-DAY cap alongside the per-second
+    one, and the per-second figure is the burst, not the sustainable rate. The
+    daily cap is the one that decides this: a quota spent is spent.
+    """
+    per_sec, per_min, per_day = 10, 400, 5_000
+    print("RATE CEILING  (Zerodha Kite Connect published caps, checked 2026-09)")
+    print(f"  {'cap':<28}{'value':>10}{'vs ' + str(int(target_ops)) + '/s target':>22}")
+    print(f"  {'orders per second (burst)':<28}{per_sec:>10,}"
+          f"{target_ops / per_sec:>21.1f}x over")
+    print(f"  {'orders per minute':<28}{per_min:>10,}"
+          f"{target_ops * 60 / per_min:>21.1f}x over")
+    print(f"  {'orders per day':<28}{per_day:>10,}"
+          f"{per_day / target_ops:>18,.0f}s of trading")
+    print(f"  sustainable rate from the per-minute cap: "
+          f"{per_min/60:.1f} orders/sec, not {per_sec}.")
+    print(f"  {int(target_ops)}/s exhausts the DAY in {per_day/target_ops:,.0f} "
+          f"seconds. The cap is per API key, per user.")
+    print()
+    print("  What the target costs per second, if every order filled one lot:")
+    print(f"    fees        {target_ops * fee:>12,.0f} /sec   "
+          f"{target_ops * fee * 60:>14,.0f} /min")
+    print(f"    round trips {target_ops / 2:>12,.0f} /sec   "
+          f"gross needed to break even: {target_ops * fee:,.0f}/sec")
+    print()
+    print("  Contracts needed to SUPPLY that rate, measured in this sim:")
+    print(f"    {signal_per_contract_per_s:.3f} signals/sec per contract watched")
+    n = target_ops / signal_per_contract_per_s if signal_per_contract_per_s else 0
+    print(f"    -> {n:,.0f} option contracts across the three indices "
+          f"({n/3:,.0f} each,")
+    print(f"       about {n/3/2:,.0f} strikes per index counting calls and puts).")
+    print()
+
+
 # ── build ──────────────────────────────────────────────────────────────────
 def make_leg(spec, base_token, t_years, iv, cfg):
     spot = SPOTS[spec.symbol]
@@ -273,6 +312,7 @@ def row(r: dict) -> str:
 def sweep(args) -> int:
     n = args.repeats
     print_breakeven(args.fee, args.capture)
+    print_rate_reality(args.target_ops, args.fee, args.supply_per_contract)
     print(f"Every row is the mean of {n} independent market draws. "
           f"'sd' is the spread across them,")
     print(f"'w' how many of the {n} were net positive. A difference smaller "
@@ -335,6 +375,10 @@ def main() -> int:
                    help="per-lot fee per FILL; a round trip is twice this")
     p.add_argument("--capture", type=float, default=0.60)
     p.add_argument("--passive", action="store_true")
+    p.add_argument("--target-ops", type=float, default=40.0)
+    p.add_argument("--supply-per-contract", type=float, default=0.107,
+                   help="signals/sec/contract; 64 signals over 8s on 75 "
+                        "contracts = 0.107")
     return sweep(p.parse_args())
 
 
