@@ -81,3 +81,35 @@ def implied_vol(price: float, s: float, k: float, t: float, is_call: bool,
         if hi - lo < tol:
             break
     return (lo + hi) * 0.5
+
+
+def bs_theta_call(s: float, k: float, t: float, iv: float, r: float = 0.065,
+                  q: float = 0.0) -> float:
+    """Per YEAR, and negative. Divide by 6.25*252 for per trading hour.
+
+    A scalp holds for seconds, so theta per trade looks negligible -- until you
+    notice it is charged on every trade and the target is one or two index
+    points. At 3 days to expiry it is the largest number in the greeks.
+    """
+    if t <= 0.0 or iv <= 0.0 or s <= 0.0:
+        return 0.0
+    from math import log, sqrt, exp, pi
+    d1 = (log(s / k) + (r - q + 0.5 * iv * iv) * t) / (iv * sqrt(t))
+    d2 = d1 - iv * sqrt(t)
+    pdf = exp(-0.5 * d1 * d1) / sqrt(2.0 * pi)
+    return (-s * exp(-q * t) * pdf * iv / (2.0 * sqrt(t))
+            - r * k * exp(-r * t) * norm_cdf(d2)
+            + q * s * exp(-q * t) * norm_cdf(d1))
+
+
+def bs_theta_put(s: float, k: float, t: float, iv: float, r: float = 0.065,
+                 q: float = 0.0) -> float:
+    if t <= 0.0 or iv <= 0.0 or s <= 0.0:
+        return 0.0
+    from math import log, sqrt, exp, pi
+    d1 = (log(s / k) + (r - q + 0.5 * iv * iv) * t) / (iv * sqrt(t))
+    d2 = d1 - iv * sqrt(t)
+    pdf = exp(-0.5 * d1 * d1) / sqrt(2.0 * pi)
+    return (-s * exp(-q * t) * pdf * iv / (2.0 * sqrt(t))
+            + r * k * exp(-r * t) * norm_cdf(-d2)
+            - q * s * exp(-q * t) * norm_cdf(-d1))
