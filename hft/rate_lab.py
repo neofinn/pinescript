@@ -41,9 +41,11 @@ from .multi import MultiEngine, IndexLeg
 from .orders import OrderStore, OrdType, OrdState, price_for
 from .risk import RiskGate, Reject
 from .session import Phase
+from .pricing import bs_call, bs_put
 from .signals import OptionSignal
 from .adapters.sim import SimFeed
 from .adapters.limitsim import LimitGateway
+from .costs import NSE_MEMBER, BSE_MEMBER, NSE_RETAIL, FLAT_25, BY_VENUE
 
 SPOTS = {"NIFTY": 23_200.0, "BANKNIFTY": 52_000.0, "SENSEX": 76_000.0}
 
@@ -52,13 +54,14 @@ class Cfg:
     """One point in the sweep."""
     __slots__ = ("edge_ticks", "spread_frac", "capture", "orders_per_sec",
                  "min_gap_us", "max_strikes", "each_side", "fee", "seconds",
-                 "capital", "goal", "passive", "max_book_age_us", "hz", "seed")
+                 "capital", "goal", "passive", "max_book_age_us", "hz", "seed",
+                 "premium_band")
 
     def __init__(self, edge_ticks=1.0, spread_frac=0.55, capture=0.60,
                  orders_per_sec=25.0, min_gap_us=1_000, max_strikes=8,
                  each_side=6, fee=25.0, seconds=20.0, capital=500_000.0,
                  goal=0.0, passive=False, max_book_age_us=50_000, hz=200,
-                 seed=0):
+                 seed=0, premium_band=(0.0, 1e9)):
         self.edge_ticks = edge_ticks
         self.spread_frac = spread_frac
         self.capture = capture
@@ -74,6 +77,7 @@ class Cfg:
         self.max_book_age_us = max_book_age_us
         self.hz = hz
         self.seed = seed
+        self.premium_band = premium_band
 
     def clone(self, **kw) -> "Cfg":
         d = {k: getattr(self, k) for k in Cfg.__slots__}
@@ -82,69 +86,92 @@ class Cfg:
 
 
 # ── the floor ──────────────────────────────────────────────────────────────
-def breakeven_table(fee_per_lot: float, capture: float, tick: float = 0.05):
-    rows = []
-    rt = fee_per_lot * 2.0
-    for s in (NIFTY, BANKNIFTY, SENSEX):
-        per_unit = rt / s.lot                  # rupees of price move needed
-        ticks_captured = per_unit / tick
-        # capture_frac of the ENTRY edge is what gets taken, so the entry edge
-        # has to exceed the capture by that factor
-        entry_ticks = ticks_captured / capture if capture > 0 else float("inf")
-        rows.append((s.symbol, s.lot, rt, per_unit, ticks_captured, entry_ticks))
-    return rows
+def print_breakeven(fee: float = 0.0, capture: float = 0.60) -> None:
+    """The floor, for an exchange-member seat with zero brokerage.
 
-
-def print_breakeven(fee: float, capture: float) -> None:
-    print("BREAK-EVEN FLOOR  (arithmetic; no simulator involved)")
-    print(f"  round-trip fee {fee*2:,.0f} per lot ({fee:,.0f} x 2 fills)   "
-          f"capture_frac {capture}")
-    print(f"  {'index':<11}{'lot':>5}{'RT fee':>9}{'Rs/unit':>10}"
-          f"{'ticks to capture':>18}{'entry edge ticks':>18}")
-    for sym, lot, rt, per_unit, cap_t, ent_t in breakeven_table(fee, capture):
-        print(f"  {sym:<11}{lot:>5}{rt:>9,.0f}{per_unit:>10.3f}"
-              f"{cap_t:>18.1f}{ent_t:>18.1f}")
-    print("  A trade capturing fewer ticks than the last column loses money at")
-    print("  ANY order rate. Sending more of them loses money faster.")
+    With brokerage gone the cost is almost entirely proportional to premium, so
+    the break-even is a percentage, identical across indices, and lot size
+    drops out of it completely. What decides the hurdle is how expensive the
+    option is -- which makes it a choice, not a constant.
+    """
+    m, b = NSE_MEMBER, BSE_MEMBER
+    print("BREAK-EVEN FLOOR  (statutory stack, zero brokerage, exchange member)")
+    print(f"  NSE round trip {m.round_trip_frac()*100:.4f}% of premium   "
+          f"BSE {b.round_trip_frac()*100:.4f}%")
+    print("  Lot size does NOT appear. A flat per-lot fee made SENSEX worst")
+    print("  because its lot is smallest; a proportional one makes the")
+    print("  EXPENSIVE option worst, whatever the lot.")
+    print()
+    print(f"  {'premium':>9}{'Rs/unit':>10}{'break-even ticks':>18}"
+          f"{'entry edge ticks':>18}   {'typical of':<28}")
+    notes = {10: "far OTM weekly", 50: "OTM", 100: "NIFTY near-ATM",
+             150: "NIFTY ATM weekly", 250: "", 400: "BANKNIFTY ATM",
+             500: "SENSEX ATM", 20: "deep OTM"}
+    for pr in (10, 20, 50, 100, 150, 250, 400, 500):
+        t = m.breakeven_ticks(pr)
+        print(f"  {pr:>9,}{m.round_trip_frac()*pr:>10.3f}{t:>18.2f}"
+              f"{t/capture:>18.2f}   {notes.get(pr,''):<28}")
+    print()
+    print("  Where it goes, one NIFTY lot (65) at premium 150:")
+    tot = 0.0
+    for n, v, sh in m.breakdown(150.0, 65):
+        if v > 0.001:
+            print(f"    {n:<26}{v:>9.2f}{sh*100:>8.1f}%")
+        tot += v
+    print(f"    {'TOTAL round trip':<26}{tot:>9.2f}")
+    print("  STT alone is 63% of it and is not negotiable at any seat. Zero")
+    print("  brokerage removed the flat part; the part that scales with size")
+    print("  is untouched.")
     print()
 
 
 def print_rate_reality(target_ops: float, fee: float,
                        signal_per_contract_per_s: float) -> None:
-    """What a 40-orders-per-second target runs into before any P&L question.
+    """Member-seat version. The retail broker quota no longer applies.
 
-    The caps are Zerodha Kite Connect's published ones, checked 2026-09. Other
-    brokers differ -- Dhan and Angel publish higher per-second numbers -- but
-    all of them carry a per-MINUTE and per-DAY cap alongside the per-second
-    one, and the per-second figure is the burst, not the sustainable rate. The
-    daily cap is the one that decides this: a quota spent is spent.
+    Kite Connect's 10/sec, 400/min and 5,000/day were the binding constraint on
+    a customer API and they are gone at member level. What replaces them is not
+    a published number: NSE configures a message rate per session per member,
+    with colocation LAN sessions allowed the configured rate plus 10%. That
+    figure comes from your own connectivity agreement, so it is an input here
+    rather than something this module can assert.
     """
-    per_sec, per_min, per_day = 10, 400, 5_000
-    print("RATE CEILING  (Zerodha Kite Connect published caps, checked 2026-09)")
-    print(f"  {'cap':<28}{'value':>10}{'vs ' + str(int(target_ops)) + '/s target':>22}")
-    print(f"  {'orders per second (burst)':<28}{per_sec:>10,}"
-          f"{target_ops / per_sec:>21.1f}x over")
-    print(f"  {'orders per minute':<28}{per_min:>10,}"
-          f"{target_ops * 60 / per_min:>21.1f}x over")
-    print(f"  {'orders per day':<28}{per_day:>10,}"
-          f"{per_day / target_ops:>18,.0f}s of trading")
-    print(f"  sustainable rate from the per-minute cap: "
-          f"{per_min/60:.1f} orders/sec, not {per_sec}.")
-    print(f"  {int(target_ops)}/s exhausts the DAY in {per_day/target_ops:,.0f} "
-          f"seconds. The cap is per API key, per user.")
+    m = NSE_MEMBER
+    print("RATE CEILING  (exchange-member seat)")
+    print("  Retail broker caps (10/s, 400/min, 5,000/day) no longer apply.")
+    print("  NSE sets a message rate PER SESSION PER MEMBER; colocation LAN")
+    print("  sessions get the configured rate +10%. That number is in your")
+    print("  connectivity agreement -- this lab cannot look it up for you.")
     print()
-    print("  What the target costs per second, if every order filled one lot:")
-    print(f"    fees        {target_ops * fee:>12,.0f} /sec   "
-          f"{target_ops * fee * 60:>14,.0f} /min")
-    print(f"    round trips {target_ops / 2:>12,.0f} /sec   "
-          f"gross needed to break even: {target_ops * fee:,.0f}/sec")
+    print("  Still live at member level:")
+    print("    * order-to-trade ratio penalties fall on the MEMBER. SEBI's")
+    print("      2026-02-04 revision exempts option orders within +/-40% of")
+    print("      LTP or +/-Rs20, whichever is higher, so at-the-touch orders")
+    print("      are outside the framework. A passive book that cancels most")
+    print("      of what it quotes is the case to check, not this one.")
+    print("    * every algo needs its exchange-approved unique identifier.")
     print()
-    print("  Contracts needed to SUPPLY that rate, measured in this sim:")
-    print(f"    {signal_per_contract_per_s:.3f} signals/sec per contract watched")
+    print(f"  What {int(target_ops)}/s costs per second at a 150 premium, "
+          f"one NIFTY lot per order:")
+    rt = m.round_trip_frac() * 150.0 * 65
+    print(f"    cost per round trip   {rt:>10,.2f}")
+    print(f"    at {int(target_ops/2)} round trips/sec "
+          f"{rt*target_ops/2:>13,.0f} /sec   "
+          f"{rt*target_ops/2*60:>12,.0f} /min")
+    print(f"    gross needed to break even: "
+          f"{rt*target_ops/2:,.0f}/sec")
+    print()
+    print("  Contracts needed to SUPPLY that rate, measured on this driver:")
+    print("    30 contracts -> 22 orders/s    126 -> 60/s")
+    print("    78 contracts -> 43 orders/s    246 -> 140/s")
+    print(f"    roughly {signal_per_contract_per_s:.2f} orders/sec per contract, "
+          f"near enough linear.")
     n = target_ops / signal_per_contract_per_s if signal_per_contract_per_s else 0
-    print(f"    -> {n:,.0f} option contracts across the three indices "
-          f"({n/3:,.0f} each,")
-    print(f"       about {n/3/2:,.0f} strikes per index counting calls and puts).")
+    print(f"    -> {int(target_ops)}/s needs about {n:,.0f} contracts: "
+          f"{n/3:,.0f} per index,")
+    print(f"       ~{n/3/2:,.0f} strikes each counting calls and puts. "
+          f"That is roughly")
+    print("       what the default each_side=6 already watches.")
     print()
 
 
@@ -154,15 +181,30 @@ def make_leg(spec, base_token, t_years, iv, cfg):
     atm = round(spot / spec.strike_step) * spec.strike_step
     contracts, sigs = [], []
     tok = base_token + 1
+    lo, hi = cfg.premium_band
     for i in range(-cfg.each_side, cfg.each_side + 1):
         k = atm + i * spec.strike_step
         for is_call in (True, False):
+            # Under a proportional cost the hurdle is a fixed % of premium, so
+            # WHICH contracts you watch is a cost decision, not just a breadth
+            # one. Band by premium rather than by strike offset: a 50-point
+            # NIFTY step and a 100-point SENSEX step are not comparable, but
+            # "options worth 40 to 120 rupees" is.
+            prem = (bs_call(spot, k, t_years, iv) if is_call
+                    else bs_put(spot, k, t_years, iv))
+            if not (lo <= prem <= hi):
+                tok += 1
+                continue
             contracts.append(dict(token=tok, strike=k, is_call=is_call))
             sigs.append(OptionSignal(tok, k, is_call, iv, spec.lot, spec.tick,
                                      min_edge_ticks=cfg.edge_ticks,
                                      spread_frac=cfg.spread_frac,
                                      max_book_age_us=cfg.max_book_age_us))
             tok += 1
+    if not contracts:                     # band matched nothing on this index
+        contracts.append(dict(token=tok, strike=atm, is_call=True))
+        sigs.append(OptionSignal(tok, atm, True, iv, spec.lot, spec.tick,
+                                 min_edge_ticks=1e9))
     leg = IndexLeg(spec, base_token, sigs, t_years, 1, cfg.max_strikes)
     leg.exits.capture_frac = cfg.capture
     feed = SimFeed(base_token, contracts, spot, t_years, iv, tick=spec.tick,
@@ -193,7 +235,9 @@ def run_det(cfg: Cfg) -> dict:
                     min_gap_us=cfg.min_gap_us, profit_goal=cfg.goal)
     eng = MultiEngine(legs, risk)
     store = OrderStore()
-    gws = {s.symbol: LimitGateway(s.tick, store, fee_per_lot=cfg.fee,
+    # fee_per_lot=0: cost is charged in MultiEngine._close off both legs
+    # actual fill prices, because it is a fraction of premium, not flat.
+    gws = {s.symbol: LimitGateway(s.tick, store, fee_per_lot=0.0,
                                   seed=i + 1 + cfg.seed)
            for i, s in enumerate(specs)}
     for f in feeds:
@@ -253,7 +297,7 @@ def run_det(cfg: Cfg) -> dict:
     eng.leave()
 
     elapsed = (now_ns() - t0) / 1e9            # virtual seconds
-    fees = sum(g.fees_paid for g in gws.values())
+    fees = eng.costs
     fills = sum(g.passive_fills + g.marketable_fills for g in gws.values())
     trades = sum(eng.trades_by_symbol.values())
     rej = risk.reject_counts
@@ -261,14 +305,15 @@ def run_det(cfg: Cfg) -> dict:
         edge_ticks=cfg.edge_ticks, spread_frac=cfg.spread_frac,
         ops_target=cfg.orders_per_sec, min_gap_us=cfg.min_gap_us,
         max_strikes=cfg.max_strikes, each_side=cfg.each_side,
-        contracts=cfg.each_side * 2 * 2 * 3 + 3, fee=cfg.fee,
+        contracts=sum(len(l.signals) for l in legs), fee=cfg.fee,
         elapsed=elapsed, ticks=eng._ticks,
         orders=risk.orders_sent, fills=fills, trades=trades,
         ops=risk.orders_sent / elapsed if elapsed else 0.0,
         tps=trades / elapsed if elapsed else 0.0,
-        gross=risk.realised, fees=fees, net=risk.realised - fees,
-        gross_per_fill=risk.realised / fills if fills else 0.0,
-        fee_share=fees / risk.realised if risk.realised > 0 else float("inf"),
+        gross=eng.gross, fees=fees, net=eng.gross - fees,
+        gross_per_fill=eng.gross / fills if fills else 0.0,
+        fee_share=fees / eng.gross if eng.gross > 0 else float("inf"),
+        avg_premium=eng.premium_sum / eng.premium_n if eng.premium_n else 0.0,
         rate_limit=rej[Reject.RATE_LIMIT], pos_limit=rej[Reject.POSITION_LIMIT],
         killed=risk.killed,
         per_symbol={k: (eng.trades_by_symbol.get(k, 0),
@@ -281,7 +326,7 @@ def repeat(cfg: Cfg, n: int) -> dict:
     runs = [run_det(cfg.clone(seed=i * 101)) for i in range(n)]
     out = dict(runs[0])
     for k in ("ops", "tps", "orders", "fills", "trades", "gross", "fees",
-              "net", "gross_per_fill"):
+              "net", "gross_per_fill", "avg_premium"):
         out[k] = statistics.mean(r[k] for r in runs)
     out["net_sd"] = statistics.pstdev([r["net"] for r in runs]) if n > 1 else 0.0
     out["net_lo"] = min(r["net"] for r in runs)
@@ -294,8 +339,8 @@ def repeat(cfg: Cfg, n: int) -> dict:
 # ── reporting ──────────────────────────────────────────────────────────────
 HDR = (f"{'sprd':>5} {'tgt/s':>6} {'gap_us':>7} {'strk':>5} {'ctr':>4} | "
        f"{'ord/s':>6} {'trd/s':>6} {'orders':>7} {'fills':>6} | "
-       f"{'gross':>10} {'fees':>9} {'NET':>10} {'sd':>8} {'w':>4} "
-       f"{'g/fill':>7} {'fee%':>5}")
+       f"{'gross':>10} {'costs':>9} {'NET':>10} {'sd':>8} {'w':>4} "
+       f"{'prem':>6} {'g/trade':>8} {'cost%':>6}")
 
 
 def row(r: dict) -> str:
@@ -306,7 +351,8 @@ def row(r: dict) -> str:
             f"{r['fills']:>6.0f} | {r['gross']:>+10,.0f} {r['fees']:>9,.0f} "
             f"{r['net']:>+10,.0f} {r.get('net_sd',0):>8,.0f} "
             f"{r.get('wins',0):>2}/{r.get('n',1):<1} "
-            f"{r['gross_per_fill']:>7,.0f} {fs:>5}")
+            f"{r.get('avg_premium',0):>6.0f} "
+            f"{r['gross']/r['trades'] if r['trades'] else 0:>8,.0f} {fs:>6}")
 
 
 def sweep(args) -> int:
@@ -353,15 +399,19 @@ def sweep(args) -> int:
               f"POSITION_LIMIT={r['pos_limit']:,}", flush=True)
     print()
 
-    print("SWEEP D -- the fee assumption, at the best rate found above.")
-    print("  25/lot/fill is optimistic for retail. A flat Rs20 brokerage plus")
-    print("  STT, exchange and GST on one NIFTY lot lands nearer 34.")
+    print("SWEEP D -- which PREMIUM band pays, now that cost scales with it.")
+    print("  Break-even ticks = 0.2383% x premium / tick. A 500-rupee option")
+    print("  must move 23.8 ticks to cover a round trip; a 50-rupee one, 2.4.")
+    print("  The counter-force is that cheap options have proportionally the")
+    print("  widest spreads, so this is an optimum, not a slope.")
     print(HDR)
-    for fee in (0.0, 10.0, 25.0, 34.0, 50.0):
+    for lo, hi in ((0, 25), (25, 60), (60, 120), (120, 250), (250, 1e9),
+                   (0, 1e9)):
         r = repeat(base.clone(spread_frac=0.55, orders_per_sec=1000.0,
-                              min_gap_us=200, max_strikes=50, each_side=20,
-                              fee=fee), n)
-        print(row(r), flush=True)
+                              min_gap_us=200, max_strikes=60, each_side=20,
+                              premium_band=(lo, hi)), n)
+        lbl = f"{lo:.0f}-{'inf' if hi > 1e8 else f'{hi:.0f}'}"
+        print(f"{lbl:>10}  " + row(r)[10:], flush=True)
     print()
     return 0
 
@@ -376,9 +426,9 @@ def main() -> int:
     p.add_argument("--capture", type=float, default=0.60)
     p.add_argument("--passive", action="store_true")
     p.add_argument("--target-ops", type=float, default=40.0)
-    p.add_argument("--supply-per-contract", type=float, default=0.107,
-                   help="signals/sec/contract; 64 signals over 8s on 75 "
-                        "contracts = 0.107")
+    p.add_argument("--supply-per-contract", type=float, default=0.55,
+                   help="orders/sec per contract watched, measured on this "
+                        "driver: 30 contracts -> 22/s, 78 -> 43/s, 246 -> 140/s")
     return sweep(p.parse_args())
 
 

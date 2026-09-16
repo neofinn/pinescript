@@ -15,6 +15,7 @@ from .session import Phase
 from .signals import OptionSignal
 from .adapters.sim import SimFeed
 from .adapters.limitsim import LimitGateway
+from .costs import NSE_MEMBER
 
 SPOTS = {"NIFTY": 23_200.0, "BANKNIFTY": 52_000.0, "SENSEX": 76_000.0}
 
@@ -56,8 +57,13 @@ async def main_async(a) -> int:
                     profit_goal=a.goal)
     eng = MultiEngine(legs, risk)
     store = OrderStore()
+    # fee_per_lot=0 on purpose: the statutory stack (STT, exchange charge,
+    # GST, stamp) is a fraction of premium, not a flat per-lot fee, so it is
+    # charged in MultiEngine._close off both legs' actual prices. Leaving the
+    # gateway's flat fee on as well would bill every trade twice.
     gws = {s.symbol: LimitGateway(s.tick, store, adverse_bias=a.adverse_bias,
-                                  rebate_per_lot=a.rebate, seed=i + 1)
+                                  fee_per_lot=0.0, rebate_per_lot=a.rebate,
+                                  seed=i + 1)
            for i, s in enumerate(specs)}
     for f in feeds:
         f.set_handler(eng.on_tick)
@@ -126,9 +132,12 @@ async def main_async(a) -> int:
     print()
     for s in specs:
         print(f"  {s.symbol:<11}{gws[s.symbol].summary()}")
-    tot_fees = sum(g.fees_paid for g in gws.values())
-    print(f"\n  realised {risk.realised:+,.0f}   fees {tot_fees:,.0f}   "
-          f"NET {risk.realised - tot_fees:+,.0f}")
+    print(f"\n  gross {eng.gross:+,.0f}   statutory costs {eng.costs:,.0f}   "
+          f"NET {eng.gross - eng.costs:+,.0f}")
+    if eng.premium_n:
+        avg = eng.premium_sum / eng.premium_n
+        print(f"  mean premium traded {avg:,.1f}  -> break-even "
+              f"{NSE_MEMBER.breakeven_ticks(avg):.1f} ticks per round trip")
     print(f"  goal {a.goal:,.0f} -> {'REACHED' if risk.goal_hit else 'NOT reached'}")
     return 0
 

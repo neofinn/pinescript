@@ -15,6 +15,7 @@ which is the broker's published limit and not negotiable.
 from __future__ import annotations
 import gc
 from .book import Book as OrderBook
+from .costs import CostModel, BY_VENUE
 from .clock import now_ns, LatencyHistogram
 from .exits import ExitPolicy, ExitReason
 from .instruments import Spec
@@ -28,11 +29,15 @@ class IndexLeg:
     """Everything that belongs to one index."""
 
     __slots__ = ("spec", "u_token", "books", "signals", "positions", "exits",
-                 "guard", "t_years", "_deltas", "pending")
+                 "guard", "t_years", "_deltas", "pending", "cost")
 
     def __init__(self, spec: Spec, u_token: int, signals: list[OptionSignal],
-                 t_years: float, lots_per_strike: int, max_strikes: int) -> None:
+                 t_years: float, lots_per_strike: int, max_strikes: int,
+                 cost: CostModel | None = None) -> None:
         self.spec = spec
+        # NSE and BSE publish different transaction charges, and SENSEX is on
+        # BSE, so the cost model follows the venue rather than the strategy.
+        self.cost = cost if cost is not None else BY_VENUE[spec.venue]
         self.u_token = u_token
         self.books = {u_token: OrderBook(u_token)}
         self.signals: dict[int, OptionSignal] = {}
@@ -73,6 +78,12 @@ class MultiEngine:
         self._last_gc_ns = 0
         self._gc_every_ns = 5_000_000_000
         self.exit_counts = [0] * len(ExitReason)
+        self.costs = 0.0
+        self.gross = 0.0
+        # premium actually traded, so break-even (a % of premium) can be
+        # compared against what the trades were worth rather than assumed
+        self.premium_sum = 0.0
+        self.premium_n = 0
         self.pnl_by_symbol: dict[str, float] = {}
         self.trades_by_symbol: dict[str, int] = {}
 
@@ -206,7 +217,22 @@ class MultiEngine:
         leg.positions.close(pos.token)
         leg._deltas.pop(pos.token, None)
         self.exit_counts[reason] += 1
-        pnl = pos.mtm(px)
+        gross = pos.mtm(px)
+
+        # Both legs are charged here, off the prices they actually traded at,
+        # because the cost is a fraction of premium rather than a flat per-lot
+        # fee -- an entry at 150 and an exit at 151 do not cost the same. STT
+        # lands on whichever leg is the sell, which is what leg_cost's sign
+        # argument decides.
+        c = leg.cost
+        lot = leg.spec.lot
+        cost = (c.leg_cost(pos.entry_px, lot, pos.lots, pos.side)
+                + c.leg_cost(px, lot, pos.lots, -pos.side))
+        self.costs += cost
+        self.gross += gross
+        self.premium_sum += pos.entry_px
+        self.premium_n += 1
+        pnl = gross - cost
         self.risk.realised += pnl
         s = pos.symbol
         self.pnl_by_symbol[s] = self.pnl_by_symbol.get(s, 0.0) + pnl
@@ -241,6 +267,8 @@ class MultiEngine:
             for k in self.legs)
         return (f"ticks={self._ticks} events={self._log_n} open[{legs}] "
                 f"net_delta={self.net_delta():+.0f}\n"
+                f"  gross {self.gross:+,.0f}  costs {self.costs:,.0f}  "
+                f"net {self.gross - self.costs:+,.0f}\n"
                 f"  {self.risk.summary()}\n"
                 f"  exits[{ex or 'none'}]\n"
                 f"  {self.lat_signal.summary()}\n"

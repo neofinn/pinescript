@@ -1,145 +1,157 @@
-# 40 orders per second: what it runs into
+# 40 orders per second, on an exchange-member seat with zero brokerage
 
-Measured with `HFT_VIRTUAL_CLOCK=1 python -m hft.rate_lab`. Read the first
-section before the rest — it invalidates every earlier number in this repo that
-was produced without it.
+Measured with `HFT_VIRTUAL_CLOCK=1 python -m hft.rate_lab`. Raw output in
+`rate_sweep_output.txt`.
 
-## 0. The simulator was measuring scheduler jitter
+## What changed when the seat changed
 
-Every timing decision in this system reads `clock.now_ns`: token-bucket refill,
-the per-contract gap, book staleness, minimum hold. Under a real clock those
-decisions depend on how fast the interpreter happens to run.
+An earlier pass of this document assumed a retail customer API and a flat Rs25
+per lot per fill. Both were wrong for this setup, and they were wrong in
+different ways — one was a level, the other was a *shape*.
 
-Six runs, identical config, identical seeds:
-
-```
-net  +6,138  +2,218  +2,564  +2,564  +2,955  +1,309
-mean +2,958   sd 1,511   range 1,309..6,138   (4.7x)
-```
-
-The first pass of the threshold sweep appeared to find an optimum at
-`spread_frac 0.30` (+11,433 against +3,998 either side). It was noise. Under a
-deterministic clock that peak does not exist.
-
-`HFT_VIRTUAL_CLOCK=1` binds `now_ns` to a clock the driver advances, and a run
-becomes bit-reproducible. `real_ns` stays available for latency, which is the
-one thing that has to be measured against a real clock — run *without* the env
-var when latency is what you are measuring.
-
-## 1. The floor, which no order rate moves
-
-```
-breakeven_edge_per_unit = round_trip_fee / lot_size
-```
-
-At Rs25 per lot per fill (Rs50 round trip), capture_frac 0.60, tick 0.05:
-
-| index | lot | Rs/unit needed | ticks to capture | entry edge needed |
-|---|---|---|---|---|
-| NIFTY | 65 | 0.769 | 15.4 | 25.6 ticks |
-| BANKNIFTY | 30 | 1.667 | 33.3 | 55.6 ticks |
-| SENSEX | 20 | 2.500 | 50.0 | 83.3 ticks |
-
-The fee is fixed per round trip and does not shrink when the edge does, so this
-number is identical at one order a minute and at forty a second. Raising the
-rate does not lower the floor. It means paying it more often.
-
-SENSEX is worst because its lot is *smallest* — the fixed fee is spread over
-the fewest units. The intuition that a small lot is a cheap lot is backwards.
-
-## 2. You cannot buy trades by accepting smaller edges
-
-Entry threshold swept 16x, rate cap wide open, 75 contracts, 5 draws each:
-
-| spread_frac | orders | net | sd |
-|---|---|---|---|
-| 0.80 | 240 | +12,854 | 8,418 |
-| 0.55 | 247 | +12,831 | 8,622 |
-| 0.30 | 255 | +12,692 | 9,373 |
-| 0.10 | 257 | +12,662 | 9,335 |
-| 0.05 | 257 | +12,662 | 9,335 |
-
-A 16x looser bar bought **7% more orders**. Below 0.20 it saturates completely —
-0.10 and 0.05 are identical to the rupee — because `need` is
-`max(edge_ticks*tick, spread*spread_frac)` and the tick floor takes over.
-
-Every net difference here is a fraction of its own sd. There is no threshold
-effect to find. "More trades, smaller returns" is not a dial this strategy has.
-
-## 3. What actually limits the rate: contracts watched
-
-Signals that fired, 8 virtual seconds, marketable:
-
-| contracts | cap 40/s | cap 1000/s | signals fired | supply |
-|---|---|---|---|---|
-| 75 | 41 sent | 64 sent | 64 | **8 orders/sec** |
-| 246 | 42 sent | 778 sent | 778 | **97 orders/sec** |
-
-At 75 contracts, raising the cap from 200/s to 1000/s changes nothing: supply
-is exhausted at 64. The throttle is not the constraint — the number of
-contracts being watched is. Reaching 40 orders/sec needs roughly 374 option
-contracts across the three indices, about 62 strikes per index counting calls
-and puts.
-
-Caveat on the 246-contract number: the simulator applies the same *absolute*
-jitter (1.5 ticks) to every contract regardless of moneyness, so deep-OTM
-strikes get proportionally enormous mispricings that a real book would not
-show. Supply scaling superlinearly with strike count (0.85 signals/contract at
-each_side 6 vs 3.16 at each_side 20) is partly that artifact. Treat the 75-
-contract figure as the trustworthy one.
-
-## 4. The cap that decides it
-
-Zerodha Kite Connect published limits, checked 2026-09:
-
-| cap | value | vs 40/s |
+| | retail assumption | exchange member, zero brokerage |
 |---|---|---|
-| orders/second (burst) | 10 | 4.0x over |
-| orders/minute | 400 | 6.0x over |
-| orders/day | 5,000 | **125 seconds of trading** |
+| cost model | Rs25/lot/fill, flat | 0.2383% of premium (NSE), 0.2311% (BSE) |
+| NIFTY lot @ 150 premium | Rs50 round trip | **Rs23.23 round trip** |
+| worst contract | SENSEX (smallest lot) | the **most expensive** option, any lot |
+| order rate cap | 10/s, 400/min, 5,000/day | member session rate, per your agreement |
 
-The per-minute cap makes the sustainable rate **6.7 orders/sec**, not 10. The
-per-second figure is the burst. The daily cap is the one that settles it: at 40
-orders/sec the entire day's quota is gone in 125 seconds, and it is per API key
-per user, so a second strategy on the same key competes for it.
+The flat fee made lot size decisive: a fixed charge spread over 20 units hurts
+more than over 65, so SENSEX looked structurally worst. A proportional charge
+makes lot size **drop out of the arithmetic entirely**. What decides the hurdle
+now is how expensive the option is — and that is a choice you make, not a
+constant you inherit.
 
-Other brokers publish higher per-second numbers, but all of them carry
-per-minute and per-day caps alongside. 40/s is an exchange-membership rate, not
-a retail-API rate.
+## The cost that survives zero brokerage
 
-Separately: SEBI's revised order-to-trade framework (circular 4 Feb 2026)
-exempts equity option orders within +/-40% of LTP or +/-Rs20, whichever is
-higher, from OTR penalty. Orders at the touch are inside that, so OTR is not
-the binding problem here — the broker quota is.
+One NIFTY lot (65) at premium 150, round trip:
 
-## 5. What 40/s costs before any P&L question
+| item | Rs | share |
+|---|---|---|
+| STT (0.15%, sell leg) | 14.62 | **63.0%** |
+| exchange txn (0.03553% x2) | 6.93 | 29.8% |
+| GST 18% | 1.27 | 5.5% |
+| stamp duty (0.003%, buy leg) | 0.29 | 1.3% |
+| IPFT | 0.10 | 0.4% |
+| SEBI turnover | 0.02 | 0.1% |
+| brokerage | 0.00 | 0% |
+| **total** | **23.23** | |
 
-At Rs25 per lot per fill, one lot per order, every order filling:
+Zero brokerage removed the flat part. The part that scales with size is
+untouched, and STT is 63% of it. STT on option sales went 0.0625% → 0.10% on
+2024-10-01 and 0.10% → **0.15%** on 2026-04-01; NSE added Rs300/crore to the
+options transaction charge on 2026-03-01. These rates move — check `costs.py`
+against your own contract notes before trusting anything downstream of it.
 
-```
-fees          1,000 /sec        60,000 /min
-gross needed  1,000 /sec just to break even
-```
+## The floor, in ticks
 
-## 6. The part that is still circular
+`breakeven_ticks = 0.2383% x premium / 0.05`
 
-The P&L in sweeps A–D comes from a simulator that was *told* option quotes lag
-10–16ms and then paid for capturing exactly that. It is an assumption with a
-number attached, not a measurement. The fee sweep (D) is the only part of it
-that means anything, and only as a sensitivity:
+| premium | break-even ticks | typical of |
+|---|---|---|
+| 10 | 0.48 | far OTM weekly |
+| 50 | 2.38 | OTM |
+| 100 | 4.77 | NIFTY near-ATM |
+| 150 | 7.15 | NIFTY ATM weekly |
+| 250 | 11.91 | |
+| 400 | 19.06 | BANKNIFTY ATM |
+| 500 | 23.83 | SENSEX ATM |
 
-| fee/lot/fill | fees | net | fee share of gross |
+## 1. 40 orders/sec is already there
+
+Order supply vs contracts watched, rate cap held non-binding, 3 draws each:
+
+| each_side | contracts | orders/sec | per contract |
 |---|---|---|---|
-| 0 | 0 | +85,096 | 0% |
-| 10 | 9,236 | +75,860 | 9% |
-| 25 | 23,090 | +62,006 | 22% |
-| 34 | 31,402 | +53,693 | 30% |
-| 50 | 46,180 | +38,916 | 44% |
+| 2 | 30 | 21.8 | 0.73 |
+| 4 | 54 | 28.6 | 0.53 |
+| 6 | **78** | **42.7** | 0.55 |
+| 10 | 126 | 59.6 | 0.47 |
+| 14 | 174 | 111.5 | 0.64 |
+| 20 | 246 | 139.8 | 0.57 |
 
-Gross per fill is Rs96 and gross per round trip Rs159, so at a Rs34 fee the
-fixed cost is already 43% of what a round trip earns. Every step down in edge
-quality moves that toward 100% at a rate the order count cannot compensate for,
-because the fee scales with order count exactly as fast.
+Roughly 0.55 orders/sec per contract, near enough linear. **40/sec needs about
+75 contracts — what `each_side=6` already watches.** With the broker quota gone
+there is nothing left to raise.
 
-The single measured, non-circular number in this system remains tick-to-signal
-latency: **15.6us mean, 100us p99** on the real clock.
+> Correction: an earlier pass put this at 0.107 orders/sec/contract and claimed
+> 374 contracts were needed. That came from a side probe, not from the driver
+> the sweeps use, and it under-counted about 4x. The table above is from
+> `run_det`, the same code path as every other number here.
+
+## 2. Lowering the entry bar still does nothing
+
+Threshold swept 16x (`spread_frac` 0.80 → 0.05), cap wide open, 5 draws:
+
+| bar | orders | gross | costs | net | sd |
+|---|---|---|---|---|---|
+| 0.80 | 240 | +20,304 | 3,651 | +16,653 | 9,936 |
+| 0.55 | 247 | +20,516 | 3,834 | +16,682 | 10,118 |
+| 0.30 | 255 | +20,597 | 3,883 | +16,714 | 10,887 |
+| 0.10 | 257 | +20,652 | 3,919 | +16,733 | 10,806 |
+| 0.05 | 257 | +20,652 | 3,919 | +16,733 | 10,806 |
+
+7% more orders for a 16x looser bar, and it saturates to the rupee below 0.20
+because `need` is `max(edge_ticks*tick, spread*spread_frac)` and the tick floor
+takes over. Every net difference is a fraction of its own sd. Unchanged by the
+new cost model — this was never a cost effect.
+
+## 3. Premium band is the lever that does work
+
+All bands at cap 1000/s, `each_side=20`, 5 draws. Contract counts differ per
+band, so **net per contract watched** is the comparable column, not net:
+
+| premium band | contracts | orders | gross | costs | net | cost % of gross | net/contract |
+|---|---|---|---|---|---|---|---|
+| 0–25 | 63 | 128 | +1,052 | 91 | +960 | 10% | 15 |
+| 25–60 | 20 | 78 | +2,073 | 209 | +1,865 | 9% | 93 |
+| 60–120 | 17 | 64 | +3,549 | 405 | +3,144 | 10% | 185 |
+| **120–250** | 25 | 118 | +11,730 | 1,473 | **+10,257** | **10%** | **410** |
+| 250+ | 121 | 424 | +59,212 | 18,182 | +41,030 | **31%** | 339 |
+| all | 246 | 779 | +88,405 | 20,214 | +68,191 | 19% | 277 |
+
+Cost is a flat ~10% of gross everywhere below Rs250 of premium and jumps to
+**31%** above it. That is the arithmetic showing through: cost scales linearly
+with premium while the lag edge, measured in ticks, does not. The 120–250 band
+returns the most per contract watched.
+
+This is also where `each_side=20` goes wrong. Widening the strike range pulls
+in deep-ITM contracts at Rs500+ premium (sweep C, 246 contracts: mean premium
+498, gross +1,138 against costs 1,105 — the trade barely clears its own STT).
+Breadth is not free once cost is proportional: **the right 78 contracts beat
+the wrong 246.**
+
+## 4. What is still live at member level
+
+- **Order-to-trade ratio** penalties fall on the member. SEBI's 2026-02-04
+  revision exempts option orders within ±40% of LTP or ±Rs20, whichever is
+  higher, so orders at the touch are outside the framework. A passive book that
+  cancels most of what it quotes is the case to check — not this one.
+- Every algo needs its exchange-approved unique identifier.
+- NSE sets a message rate **per session per member**; colocation LAN sessions
+  get the configured rate +10%. That figure is in your connectivity agreement.
+  I could not find a public number and have not assumed one.
+
+## 5. What is still circular
+
+The gross in every table above comes from a simulator that was *told* option
+quotes lag 10–16ms, and then paid for capturing exactly that. The cost side is
+now real; the revenue side is an assumption with a number attached.
+
+The measured, non-circular numbers remain:
+
+- tick-to-signal latency **15.6us mean, 100us p99** (real clock)
+- order supply **0.55/sec per contract watched**
+- the cost stack, which is arithmetic over published rates
+
+## 6. The determinism fix this all depends on
+
+Every timing decision reads `clock.now_ns`. Under a real clock, six runs with
+identical config and identical seeds gave net +6,138 / +2,218 / +2,564 / +2,564
+/ +2,955 / +1,309 — sd 1,511 on a mean of 2,958, a 4.7x spread from scheduler
+jitter alone. A first pass "found" a threshold optimum at `spread_frac 0.30`;
+it was noise, and it does not exist under a deterministic clock.
+
+`HFT_VIRTUAL_CLOCK=1` binds `now_ns` to a clock the driver advances. Runs are
+bit-reproducible. Run *without* it when measuring latency — `real_ns` is
+untouched.
