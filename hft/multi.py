@@ -28,7 +28,7 @@ class IndexLeg:
     """Everything that belongs to one index."""
 
     __slots__ = ("spec", "u_token", "books", "signals", "positions", "exits",
-                 "guard", "t_years", "_deltas")
+                 "guard", "t_years", "_deltas", "pending")
 
     def __init__(self, spec: Spec, u_token: int, signals: list[OptionSignal],
                  t_years: float, lots_per_strike: int, max_strikes: int) -> None:
@@ -44,6 +44,10 @@ class IndexLeg:
         self.guard = MomentumGuard()
         self.t_years = t_years
         self._deltas: dict[int, float] = {}
+        # Tokens with an order out but no fill yet. Without this the same stale
+        # quote fires again on the next tick and you end up with N orders
+        # chasing one opportunity.
+        self.pending: dict[int, tuple] = {}
 
     def net_delta(self) -> float:
         return self.positions.net_delta(self._deltas)
@@ -144,7 +148,7 @@ class MultiEngine:
             return
         if not leg.guard.calm(ts_ns, spot):
             return
-        if not leg.positions.can_open(token):
+        if not leg.positions.can_open(token) or token in leg.pending:
             return
 
         side = sig.evaluate(book, spot, leg.t_years)
@@ -161,13 +165,41 @@ class MultiEngine:
                       int(verdict), 0)
             return
 
+        # An order is INTENT. The position opens when the venue says it filled,
+        # not when we send. Opening on submission books trades that never
+        # happened -- with passive quotes, where the great majority are
+        # cancelled unfilled, that is the difference between a result and a
+        # work of fiction.
         leg._deltas[token] = sig.last_delta
-        leg.positions.open(Position(token, leg.spec.symbol, sig.strike,
-                                    sig.is_call, side, lots, px, sig.last_theo,
-                                    sig.last_edge, leg.spec.lot))
+        leg.pending[token] = (side, lots, sig.last_theo, sig.last_edge,
+                              sig.strike, sig.is_call)
         self._pending.append((leg.spec.symbol, token, side, lots, px, "OPEN"))
         self._rec(ts_ns, leg.spec.symbol, token, side, px, sig.last_edge, 0, 0)
         self.lat_send.record(now_ns() - t0)
+
+    def on_fill(self, symbol: str, token: int, side: int, lots: int,
+                px: float) -> None:
+        """The venue filled. Only now does a position exist."""
+        leg = self.legs.get(symbol)
+        if leg is None:
+            return
+        meta = leg.pending.pop(token, None)
+        pos = leg.positions.get(token)
+        if pos is not None:                       # closing fill
+            return
+        if meta is None:
+            return
+        _side, _lots, theo, edge, strike, is_call = meta
+        leg.positions.open(Position(token, symbol, strike, is_call, side, lots,
+                                    px, theo, edge, leg.spec.lot))
+
+    def on_no_fill(self, symbol: str, token: int) -> None:
+        """Expired, cancelled or rejected. Clear the intent so the contract can
+        be quoted again rather than being locked out for the session."""
+        leg = self.legs.get(symbol)
+        if leg is not None:
+            leg.pending.pop(token, None)
+            leg._deltas.pop(token, None)
 
     def _close(self, leg: IndexLeg, pos: Position, px: float,
                reason: ExitReason, ts_ns: int) -> None:
