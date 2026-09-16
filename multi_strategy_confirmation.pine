@@ -1,0 +1,992 @@
+//@version=6
+// =====================================================================
+// MULTI-STRATEGY CONFIRMATION SYSTEM
+//
+// Eight reads of the same chart, each switchable, and a trade only when
+// enough INDEPENDENT ones agree:
+//
+//   STRUCTURE family
+//     1. RANGE BREAKOUT   — close beyond an N-bar range
+//     2. BOS              — close beyond the last swing, WITH the bias
+//   REJECTION family
+//     3. S/R PUSHBACK     — rejection approaching a swing pivot
+//     4. LIQUIDITY SWEEP  — wick THROUGH a swing, close back inside
+//   ZONE family
+//     5. ORDER BLOCK      — rejection inside the base of an impulse
+//     6. FAIR VALUE GAP   — rejection inside a 3-bar imbalance
+//   SESSION family
+//     7. ORB              — break of the session's opening range
+//   VWAP family
+//     8. EMA/VWAP CROSS   — EMA crosses the session VWAP
+//
+//   Filters (no direction of their own, so they gate rather than vote):
+//     displacement, close strength, hold-for-N-bars, relative volume,
+//     volume surge, volume delta, session window
+//
+// VWAP IS VOLUME-WEIGHTED, WHICH ON SPOT GOLD MEANS TICK-WEIGHTED
+// `ta.vwap` weights price by the volume series the feed reports. On spot
+// XAUUSD that is tick count, so the "volume" doing the weighting is
+// requote frequency rather than size — a reasonable proxy and not the
+// institutional average price the name suggests. On GC1! it is the real
+// thing. It resets each session, which is why an EMA crossing it is an
+// intraday signal rather than a trend one.
+
+// FAKEOUT CONTROL — THE THREE THAT ACTUALLY WORK
+// A fakeout is a break that closes back inside. Three filters attack it
+// from different angles and they stack:
+//
+//   1. DISPLACEMENT. The breaking bar's body must exceed a multiple of
+//      ATR. A real break leaves a body; a fakeout drifts across.
+//   2. CLOSE STRENGTH. The close must sit in the top (or bottom)
+//      `closeStrength` of the bar's own range. A break that closes
+//      mid-bar left a long wick against itself, which is the fakeout
+//      signature written into the candle.
+//   3. HOLD FOR N BARS. The strongest of the three, and the only one
+//      that is not a guess: the signal is WITHHELD for `holdBars` bars
+//      and fires only if price is still beyond the level when they have
+//      printed. A fakeout is by definition gone by then.
+//
+// Hold costs you the first N bars of the move, which is the honest
+// trade: you cannot both act immediately and know the break held. It
+// applies to the STRUCTURE family, because that is where fakeouts live —
+// rejections and zone entries are already close-confirmed against a
+// level and have nothing to fake out of.
+
+// MARKET DEPTH IS NOT AVAILABLE, AND NOTHING HERE PRETENDS OTHERWISE
+// Pine Script cannot read the order book. There is no bid size, no ask
+// size, no DOM, no Level 2 — TradingView does not expose any of it to
+// scripts, on any plan. Any indicator claiming to show "institutional
+// order flow" from a TradingView chart is inferring it from price and
+// volume, not reading it.
+//
+// The closest real substitute is VOLUME DELTA, and this script builds it
+// from `request.security_lower_tf`: pull the lower-timeframe bars inside
+// the current one and split their volume by whether each closed up or
+// down. (`ta.requestVolumeDelta` would do the same thing, but it lives in
+// TradingView's ta LIBRARY rather than the built-in ta namespace, so
+// calling it without an import does not compile — it was tried.)
+//
+// That is genuine directional information and it is still an ESTIMATE: a
+// lower-timeframe bar that closed up is ASSUMED to be buying, which is a
+// reasonable proxy and not a fact. On spot XAUUSD the volume being split
+// is tick counts, making it an estimate of an estimate; on GC1! it is
+// real traded size.
+//
+// WHY FAMILIES, AND WHY THIS IS THE IMPORTANT PART
+// Most of these are computed from the same swing pivots. A range
+// breakout, a BOS and a swept high are three descriptions of one thing:
+// price left a level. Counting them as three confirmations is counting
+// one observation three times, and it makes `minConfirmations` a number
+// that no longer means what it says — the more strategies you switch on,
+// the EASIER the filter gets, which is the opposite of the intent.
+//
+// So each family casts at most ONE vote. Two votes means two genuinely
+// different kinds of evidence: something structural happened AND price
+// rejected a level, or a zone held AND structure broke. `capFamilies`
+// turns this off if you want to see the difference; leaving it off is
+// how a confirmation system quietly becomes a single-signal system with
+// extra steps.
+//
+// ALL EIGHT ARE EVENTS
+// Each is true on the bar the thing happens and false afterwards, so a
+// vote count is a count of things that OCCURRED. An earlier version
+// carried a trend-following slot (Supertrend, then DI/ADX) and it was a
+// STATE — true for as long as the trend lasted — which meant "2 of 4"
+// could be satisfied by one event plus a standing condition. It also
+// vetoed pullback entries, since an ATR band flips exactly when price
+// retests support. Removing it was the fix; do not add another state.
+//
+// DISPLACEMENT
+// The single best filter on a structural break. An institutional move
+// leaves a large body, not a drift across the line. `requireDisplacement`
+// demands the breaking bar's body exceed `displacementAtr` x ATR, which
+// discards most false breaks. It applies to the STRUCTURE family only —
+// a rejection is not supposed to be violent.
+//
+// WHAT LAGS, AND WHY THAT IS NOT A BUG
+// A swing pivot is not confirmed until `pivotRight` bars have printed
+// after it, so `ta.pivothigh()` returns a value already shifted back by
+// that many bars. That is correct — the script cannot see a pivot before
+// the chart could have — and it means every structure signal here is
+// late by design. Reducing pivotRight makes them arrive sooner and makes
+// more of them false. There is no setting that gives you early AND right.
+//
+// REPAINTING
+// Signals are evaluated on bar close. Do not enable "calc on every tick",
+// which lets a vote appear and vanish inside a bar. The breakout range
+// uses [1] so it excludes the live bar — a range containing the bar being
+// tested moves with price and nothing ever breaks it.
+//
+// ENTRIES ARE LIMIT ORDERS, AND THEY EXPIRE
+// A signal places a limit order `entryAtrMult` x ATR from the level that
+// justified it — a retest, not a chase. If the retest price is not on the
+// correct side of the market the order is NOT placed, because a buy limit
+// at or above the market fills instantly at the market. An unfilled order
+// is cancelled after `orderExpiryBars`, since one left alive fills days
+// later in a setup that no longer exists.
+//
+// THIS IS A BACKTEST INSTRUMENT
+// TradingView fills every limit order price touches, with no queue, no
+// partial fills and no slippage beyond what you configure. Real fills are
+// worse. Treat a losing backtest as conclusive and a winning one as a
+// reason to go and measure the spread you actually pay.
+//
+// VOLUME IS A FILTER, AND ON GOLD IT IS TICK VOLUME
+// Volume has no direction, so it cannot vote — it gates. `useVolume`
+// requires the signal bar to trade above `volMult` x its own recent
+// average.
+//
+// Read it for what it is. XAUUSD from a spot CFD feed reports TICK COUNT,
+// not contracts: it measures how often the price was requoted, not how
+// much was transacted. It tracks real futures volume well enough to be
+// useful as a participation proxy and badly enough that calling a spike
+// "institutional accumulation" would be a story, not a measurement. On a
+// futures symbol (GC1!) the same input is real traded size.
+//
+// WHY CHoCH WAS REMOVED
+// It fired and changed nothing. Ported to Python and run over 269 real
+// daily bars it triggered three times, and a 20-bar range breakout fired
+// on all three of those bars — so the structure vote was already cast and
+// toggling CHoCH could not alter a single decision. A swing low usually
+// IS the recent range low, which makes the two fire together. The
+// FIRED/SOLO columns exist so the next redundant idea is visible in one
+// glance instead of one A/B test.
+//
+// WHAT MEASUREMENT SAYS ABOUT THE ZONE FAMILY
+// The Python port of this script (scripts/backtest_port.py) was run over
+// 1,513 real GC=F 45m bars and every trade's level was attributed to the
+// strategy that supplied it. Order blocks and fair value gaps supplied ALL
+// of them, because zones sit first in the level priority, and they were
+// where the losses were:
+//
+//   baseline, both zones            19 trades   -4.40R   PF 0.60
+//   baseline, order blocks banned   20 trades   -1.65R   PF 0.83
+//   baseline, both zones banned     19 trades   +1.43R   PF 1.18
+//   filtered, order blocks banned    8 trades   +1.96R   PF 1.98
+//
+// Order blocks were the worst source under every configuration tested, so
+// `useZones` off is the measured setting. It is a switch rather than a
+// deletion because eight trades is not enough to delete code over.
+//
+// ON "PROPHECY"-STYLE OUTPUT
+// The commercial indicator of that name advertises live bias, entry, stop,
+// TP1/TP2/TP3, breakeven and trailing, and attributes it to orderflow. It
+// is closed source, so none of its logic is reproduced here, and the
+// orderflow claim meets the same wall described above: Pine cannot read
+// the book, so any such product is inferring from price and volume too.
+//
+// What it lists is mostly already here — bias, entry, stop, breakeven and
+// trailing all predate this note. What was missing is SCALED EXITS, so
+// `useScaledExit` adds them: TP1 and TP2 take a configured percentage off
+// and TP3 closes the remainder, each at an R multiple of the trade's own
+// risk. The stop rides on every leg, so a runner is never left unprotected.
+// Off by default, because the single-exit path is the one with a backtest
+// behind it.
+//
+// ON VERY HIGH WIN RATES
+// This system will not produce one, and a version that did would be worse.
+// Win rate and profit are close to independent: a 25% win rate at 10.9:1
+// and a 48% win rate at 3.3:1 were measured on this same instrument and
+// the 25% version made more money. Systems advertising 95%+ get there by
+// risking thirty to make one, which hides the loss rather than removing
+// it. For FEWER, BETTER trades set minConfirmations to 3 and switch on
+// displacement, volume and a session — that is selectivity, which is a
+// real thing, rather than a win rate, which is a ratio you can rig.
+// =====================================================================
+
+strategy("Multi-Strategy Confirmation",
+     overlay              = true,
+     initial_capital      = 100000,
+     default_qty_type     = strategy.percent_of_equity,
+     default_qty_value    = 100,
+     pyramiding           = 0,
+     calc_on_order_fills  = false,
+     process_orders_on_close = true,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.03,
+     slippage             = 2,
+     max_boxes_count      = 500,
+     max_labels_count     = 100)
+
+// ------------------------------------------------------------------ inputs
+grpC = "Confirmation"
+minConfirmations = input.int(2, "Votes required to enter", minval=1, maxval=5, group=grpC,
+     tooltip="Votes are counted per FAMILY when capFamilies is on, so the ceiling is 5: structure, rejection, zone, session, vwap.")
+capFamilies = input.bool(true, "One vote per family (recommended)", group=grpC,
+     tooltip="Correlated signals are computed from the same pivots. Without this, switching on more strategies makes the filter LOOSER, not tighter, because one observation gets counted several times.")
+blockOnOpposition = input.bool(true, "Block if any family opposes", group=grpC)
+
+grpF = "Filters"
+requireDisplacement = input.bool(false, "Structural breaks need displacement", group=grpF,
+     tooltip="The breaking bar's body must exceed displacementAtr x ATR. Applies to the STRUCTURE family only — a rejection is not supposed to be violent.")
+displacementAtr = input.float(0.8, "Displacement body (x ATR)", minval=0.1, step=0.1, group=grpF)
+
+useVolume = input.bool(false, "Signal bar needs above-average volume", group=grpF,
+     tooltip="A participation filter, not a vote — volume has no direction. On spot XAUUSD this is TICK COUNT, not contracts: it measures requote frequency, a decent proxy for activity and not a measurement of size. On GC1! it is real traded volume.")
+volMult = input.float(1.5, "Volume vs its average (x)", minval=0.5, step=0.1, group=grpF)
+volLen = input.int(20, "Volume average length", minval=2, group=grpF)
+useVolSurge = input.bool(false, "Require a volume SURGE, not just above average", group=grpF,
+     tooltip="A z-score: how many standard deviations above its own mean this bar traded. Above-average volume is common; a 2-sigma surge is a step change, which is what 'sudden' means numerically.")
+volZ = input.float(2.0, "Surge z-score", minval=0.5, step=0.25, group=grpF)
+useVolDelta = input.bool(false, "Require volume delta to agree with the trade", group=grpF,
+     tooltip="The closest thing to order flow that Pine can see. Drops to a lower timeframe and splits volume into uptick and downtick parts. It is an ESTIMATE from bars, not a read of the order book — Pine has no access to the book at all. Errors if the lower timeframe is not finer than the chart's.")
+deltaTf = input.timeframe("1", "Volume delta lower timeframe", group=grpF)
+useSession = input.bool(false, "Trade only inside a session", group=grpF)
+sessionSpec = input.session("0700-1600", "Session (exchange time)", group=grpF,
+     tooltip="London plus the New York overlap in UTC terms. Check your chart's timezone — this is evaluated in exchange time, not yours.")
+
+grpK = "Fakeout control"
+closeStrength = input.float(0.0, "Break close within its own range (0-1)", minval=0.0, maxval=1.0, step=0.05, group=grpK,
+     tooltip="0 disables. 0.6 means a bullish break must close in the top 40% of its bar. A break closing mid-bar left a long wick against itself, which is what a fakeout looks like in the candle.")
+holdBars = input.int(0, "Break must hold for N bars", minval=0, maxval=20, group=grpK,
+     tooltip="The strongest fakeout filter and the only one that is not a guess. The signal is withheld this many bars and fires only if price is STILL beyond the level. Costs you the first N bars of the move — you cannot both act immediately and know the break held. 0 disables.")
+
+grpP = "Swing pivots (feeds structure, S/R and sweeps)"
+pivotLeft = input.int(10, "Pivot left bars", minval=1, group=grpP)
+pivotRight = input.int(10, "Pivot right bars", minval=1, group=grpP,
+     tooltip="Also the lag: a pivot is not confirmed until this many bars have printed after it.")
+
+grp1 = "1. Range breakout (structure)"
+useBreakout = input.bool(true, "Enabled", group=grp1)
+breakoutLen = input.int(20, "Range lookback (bars)", minval=2, group=grp1)
+
+grp2 = "2. BOS - break of structure (structure)"
+useBos = input.bool(true, "Enabled", group=grp2,
+     tooltip="Close beyond the last swing in the direction the structure is already going. Continuation.")
+
+grp3 = "3. S/R pushback (rejection)"
+useSR = input.bool(true, "Enabled", group=grp3)
+srTolAtr = input.float(0.5, "Touch tolerance (x ATR)", minval=0.05, step=0.05, group=grp3)
+
+grp4 = "4. Liquidity sweep (rejection)"
+useSweep = input.bool(true, "Enabled", group=grp4,
+     tooltip="The wick trades THROUGH the swing and the close comes back inside — stops taken, price rejected. Stricter than a pushback, which only requires price to approach.")
+
+grp5 = "5. Order block (zone)"
+useZones = input.bool(true, "Enabled", group=grp5,
+     tooltip="The base an impulse departed from: when a bar's body exceeds impulseAtr x ATR, the bar BEFORE it becomes the zone.")
+impulseAtr = input.float(1.5, "Impulse body (x ATR)", minval=0.5, step=0.1, group=grp5)
+
+grp6 = "6. Fair value gap (zone)"
+useFvg = input.bool(true, "Enabled", group=grp6,
+     tooltip="A three-bar imbalance: bar 1's high below bar 3's low leaves a range price traded through without trading in. Entry is the return to it.")
+fvgMinAtr = input.float(0.25, "Minimum gap size (x ATR)", minval=0.0, step=0.05, group=grp6)
+
+grp7 = "7. Opening range breakout (session)"
+useOrb = input.bool(false, "Enabled", group=grp7,
+     tooltip="The session's first minutes set a range; the break of it is the signal. Fires at most once per side per day by construction, which is the cheapest way to get from many trades to few.")
+orbSession = input.session("0800-0830", "Opening range window (exchange time)", group=grp7,
+     tooltip="Gold: 0800-0830 is the London open, 1330-1400 the New York cash open. Check your chart's timezone — this is exchange time, not yours.")
+
+grp8 = "8. EMA / VWAP cross (vwap)"
+useEmaVwap = input.bool(false, "Enabled", group=grp8,
+     tooltip="The CROSS is the signal, not the side — an EMA sitting above VWAP is a state and would break the one-vote-per-event rule the rest of this script runs on.")
+emaLen = input.int(21, "EMA length", minval=1, group=grp8)
+
+grpT = "Targets (scaled exit)"
+useScaledExit = input.bool(false, "Scale out at TP1 / TP2 / TP3", group=grpT,
+     tooltip="Off by default: the single-exit path is the one with a backtest behind it. On, TP1 and TP2 take their percentage off and TP3 closes the remainder. The stop rides on every leg, so the runner is never unprotected.")
+tp1R = input.float(1.0, "TP1 at (R)", minval=0.1, step=0.1, group=grpT)
+tp1Pct = input.int(40, "TP1 takes (% of position)", minval=1, maxval=99, group=grpT)
+tp2R = input.float(2.0, "TP2 at (R)", minval=0.1, step=0.1, group=grpT)
+tp2Pct = input.int(30, "TP2 takes (% of position)", minval=1, maxval=99, group=grpT)
+tp3R = input.float(3.0, "TP3 at (R) - closes the rest", minval=0.1, step=0.1, group=grpT)
+showTradeLabels = input.bool(true, "Label entry, stop and targets on the chart", group=grpT)
+
+grpZ = "Zone handling (order blocks and FVGs)"
+zoneMaxAge = input.int(200, "Zone max age (bars)", minval=10, group=grpZ)
+zoneMaxCount = input.int(6, "Zones kept per side per type", minval=1, maxval=20, group=grpZ)
+drawZones = input.bool(true, "Draw zones", group=grpZ)
+
+grpE = "Entry"
+entryAtrMult = input.float(0.1, "Limit offset from level (x ATR)", minval=0.0, step=0.05, group=grpE)
+orderExpiryBars = input.int(5, "Cancel unfilled order after (bars)", minval=1, group=grpE)
+
+grpR = "Risk"
+atrLen = input.int(14, "ATR length", minval=1, group=grpR)
+stopAtrMult = input.float(1.5, "Initial stop beyond level (x ATR)", minval=0.1, step=0.1, group=grpR)
+breakevenR = input.float(1.0, "Lock breakeven at (R multiple)", minval=0.1, step=0.1, group=grpR)
+useTrailing = input.bool(true, "Trail the stop after breakeven", group=grpR)
+trailUsePoints = input.bool(false, "Trail a fixed distance instead of an ATR multiple", group=grpR,
+     tooltip="ATR scales the trail with volatility, which is usually right. Fixed points is for when you have measured a distance that works on one instrument and want it held there regardless.")
+trailPoints = input.float(7.0, "Trail distance (price points)", minval=0.1, step=0.5, group=grpR,
+     tooltip="In quote units: 7 on gold is $7. For scale, the median ATR(14) on GC 45m is about 15 points, so 7 is roughly half an ATR — far tighter than the 2.5x ATR the tightness dial gives.")
+trailStepPoints = input.float(3.0, "Only move the stop when it improves by (points)", minval=0.0, step=0.5, group=grpR,
+     tooltip="Stops the stop creeping a tick at a time. 0 makes it ratchet on every improvement, which is the old behaviour.")
+trailTightness = input.int(2, "Trail tightness after breakeven (1 loose - 5 tight)", minval=1, maxval=5, group=grpR)
+takeProfitR = input.float(0.0, "Take profit at (R multiple, 0 = off)", minval=0.0, step=0.5, group=grpR,
+     tooltip="Needed when the trail is off. With no trail AND no target the only exits are the initial stop and the breakeven stop, so every trade is a loss or a scratch and none can ever win.")
+
+grpA = "Webhook alerts"
+alertSecret = input.string("", "Ingest secret", group=grpA)
+alertQty = input.int(1, "Quantity to send", minval=1, group=grpA)
+
+// ------------------------------------------------------------------- atr
+atr = ta.atr(atrLen)
+atrOk = not na(atr) and atr > 0
+body = math.abs(close - open)
+
+trailAtrMult = switch trailTightness
+    1 => 3.0
+    2 => 2.5
+    3 => 2.0
+    4 => 1.5
+    => 1.0
+
+inSession = not useSession or not na(time(timeframe.period, sessionSpec))
+
+// Volume gates; it never votes, because it has no direction. na volume on a
+// feed that does not report it must not silently pass the filter, so an
+// absent series fails the test rather than being treated as sufficient.
+volAvg = ta.sma(volume, volLen)
+volSd = ta.stdev(volume, volLen)
+volOk = not useVolume or (not na(volume) and not na(volAvg) and volAvg > 0 and volume > volMult * volAvg)
+
+// "Sudden" as a number. Above-average volume is common; a 2-sigma bar is a
+// step change. Zero standard deviation means the series cannot support a
+// z-score, so the filter fails rather than dividing by zero.
+volZScore = not na(volSd) and volSd > 0 and not na(volAvg) ? (volume - volAvg) / volSd : na
+volSurgeOk = not useVolSurge or (not na(volZScore) and volZScore >= volZ)
+
+// The nearest thing to order flow Pine can reach, built here rather than
+// called: `ta.requestVolumeDelta` is in TradingView's ta LIBRARY, not the
+// built-in ta namespace, so calling it without an import fails to compile.
+// This assembles the same measure from `request.security_lower_tf`, which
+// is a genuine built-in: pull the lower-timeframe bars inside this one and
+// split their volume by whether each closed up or down.
+//
+// It remains an ESTIMATE from bars and never a read of resting orders — a
+// lower-timeframe bar that closed up is assumed to be buying, which is a
+// reasonable proxy and not a fact. See the header.
+//
+// Requested unconditionally because request functions may not sit inside a
+// conditional block.
+ltfClose = request.security_lower_tf(syminfo.tickerid, deltaTf, close)
+ltfOpen  = request.security_lower_tf(syminfo.tickerid, deltaTf, open)
+ltfVol   = request.security_lower_tf(syminfo.tickerid, deltaTf, volume)
+
+float volDelta = na
+ltfCount = math.min(array.size(ltfVol), math.min(array.size(ltfClose), array.size(ltfOpen)))
+if useVolDelta and ltfCount > 0
+    float upVol = 0.0
+    float dnVol = 0.0
+    for i = 0 to ltfCount - 1
+        v = array.get(ltfVol, i)
+        c = array.get(ltfClose, i)
+        o = array.get(ltfOpen, i)
+        if c > o
+            upVol += v
+        else if c < o
+            dnVol += v
+    volDelta := upVol - dnVol
+
+// Fails closed, like every other filter here: no lower-timeframe data means
+// the filter is unsatisfied, not satisfied.
+deltaOkLong  = not useVolDelta or (not na(volDelta) and volDelta > 0)
+deltaOkShort = not useVolDelta or (not na(volDelta) and volDelta < 0)
+
+// --------------------------------------------------------------- pivots
+// Already lagged by pivotRight when they arrive, so referencing them here
+// cannot see into the future.
+ph = ta.pivothigh(pivotLeft, pivotRight)
+pl = ta.pivotlow(pivotLeft, pivotRight)
+var float lastPH = na
+var float lastPL = na
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+
+// ------------------------------------------- STRUCTURE 1. range breakout
+// [1] excludes the live bar. Without it the range contains the bar being
+// tested, rises with it, and never breaks.
+rangeHigh = ta.highest(high, breakoutLen)[1]
+rangeLow  = ta.lowest(low, breakoutLen)[1]
+brkLong  = useBreakout and not na(rangeHigh) and close > rangeHigh
+brkShort = useBreakout and not na(rangeLow)  and close < rangeLow
+
+// ------------------------------------------------- STRUCTURE 2. BOS
+// One swing level produces at most ONE break event. Tracking the level
+// already broken is what makes this an event rather than a state: without
+// it, every subsequent close beyond the same high re-signals, and the
+// "count of things that happened" becomes a count of bars.
+var float brokenHigh = na
+var float brokenLow = na
+var int bias = 0
+
+brokeHigh = not na(lastPH) and close > lastPH and (na(brokenHigh) or lastPH != brokenHigh)
+brokeLow  = not na(lastPL) and close < lastPL and (na(brokenLow)  or lastPL != brokenLow)
+
+// A break WITH the bias is a BOS. A break against it is a change of
+// character, which is not signalled here — but the bias still flips on it,
+// because that is what makes the NEXT break in the new direction a genuine
+// BOS rather than a counter-trend break wearing the name. Removing the
+// signal must not remove the bookkeeping.
+bosLong = false
+bosShort = false
+if brokeHigh
+    if bias >= 0
+        bosLong := true
+    brokenHigh := lastPH
+    bias := 1
+if brokeLow
+    if bias <= 0
+        bosShort := true
+    brokenLow := lastPL
+    bias := -1
+
+bosLong  := useBos and bosLong
+bosShort := useBos and bosShort
+
+// ------------------------------------------- REJECTION 3. S/R pushback
+srTol = atrOk ? srTolAtr * atr : na
+srLong  = useSR and not na(lastPL) and not na(srTol) and low  <= lastPL + srTol and close > lastPL
+srShort = useSR and not na(lastPH) and not na(srTol) and high >= lastPH - srTol and close < lastPH
+
+// ---------------------------------------- REJECTION 4. liquidity sweep
+// Strictly beyond the level and back, which is the difference from a
+// pushback: the stops under that low were actually taken before price
+// rejected. A pushback only requires price to come near.
+sweepLong  = useSweep and not na(lastPL) and low  < lastPL and close > lastPL
+sweepShort = useSweep and not na(lastPH) and high > lastPH and close < lastPH
+
+// ------------------------------------------------ zone machinery (5, 6)
+var array<float> obDemTop = array.new<float>()
+var array<float> obDemBot = array.new<float>()
+var array<int>   obDemBar = array.new<int>()
+var array<float> obSupTop = array.new<float>()
+var array<float> obSupBot = array.new<float>()
+var array<int>   obSupBar = array.new<int>()
+var array<float> fvDemTop = array.new<float>()
+var array<float> fvDemBot = array.new<float>()
+var array<int>   fvDemBar = array.new<int>()
+var array<float> fvSupTop = array.new<float>()
+var array<float> fvSupBot = array.new<float>()
+var array<int>   fvSupBar = array.new<int>()
+var array<box>   zoneBoxes = array.new<box>()
+
+pushZone(array<float> tops, array<float> bots, array<int> bars, float t, float b, color col) =>
+    array.push(tops, t)
+    array.push(bots, b)
+    array.push(bars, bar_index)
+    if array.size(tops) > zoneMaxCount
+        array.shift(tops)
+        array.shift(bots)
+        array.shift(bars)
+    if drawZones
+        bx = box.new(bar_index - 1, t, bar_index + 20, b,
+             border_color=color.new(col, 40), bgcolor=color.new(col, 88))
+        array.push(zoneBoxes, bx)
+        if array.size(zoneBoxes) > 80
+            box.delete(array.shift(zoneBoxes))
+    true
+
+// Walk backwards so removal does not shift an index we have yet to visit.
+// Forward iteration with removal is how half a list gets skipped.
+pruneZones(array<float> tops, array<float> bots, array<int> bars, bool isDemand) =>
+    if array.size(tops) > 0
+        for i = array.size(tops) - 1 to 0
+            broken = isDemand ? close < array.get(bots, i) : close > array.get(tops, i)
+            stale = bar_index - array.get(bars, i) > zoneMaxAge
+            if broken or stale
+                array.remove(tops, i)
+                array.remove(bots, i)
+                array.remove(bars, i)
+    true
+
+// The bar traded INTO the zone and closed back OUT of it. Both halves are
+// needed: entering alone is price arriving, and a close inside the zone has
+// not rejected anything yet. How DEEP the bar went is deliberately not
+// tested — requiring the low to stay inside would discard the strongest
+// signal there is, a wick clean through that closes back above.
+zoneHitLong(array<float> tops) =>
+    float lvl = na
+    if array.size(tops) > 0
+        for i = 0 to array.size(tops) - 1
+            t = array.get(tops, i)
+            if low <= t and close > t
+                lvl := na(lvl) ? t : math.max(lvl, t)
+    lvl
+
+zoneHitShort(array<float> bots) =>
+    float lvl = na
+    if array.size(bots) > 0
+        for i = 0 to array.size(bots) - 1
+            b = array.get(bots, i)
+            if high >= b and close < b
+                lvl := na(lvl) ? b : math.min(lvl, b)
+    lvl
+
+// ------------------------------------------------- ZONE 5. order blocks
+isImpulse = atrOk and body > impulseAtr * atr
+if useZones and isImpulse and bar_index > 1
+    if close > open
+        pushZone(obDemTop, obDemBot, obDemBar, high[1], low[1], color.teal)
+    else
+        pushZone(obSupTop, obSupBot, obSupBar, high[1], low[1], color.maroon)
+
+// ---------------------------------------------- ZONE 6. fair value gaps
+// Three bars: the gap is the range bar 3 never traded into, left behind
+// because bar 2 moved too fast. Measured on the CLOSED bars [1] and [3]
+// so the live bar cannot create or erase one.
+fvgUpSize   = atrOk and bar_index > 3 ? low[1] - high[3] : na
+fvgDownSize = atrOk and bar_index > 3 ? low[3] - high[1] : na
+if useFvg and not na(fvgUpSize) and fvgUpSize > fvgMinAtr * atr
+    pushZone(fvDemTop, fvDemBot, fvDemBar, low[1], high[3], color.blue)
+if useFvg and not na(fvgDownSize) and fvgDownSize > fvgMinAtr * atr
+    pushZone(fvSupTop, fvSupBot, fvSupBar, low[3], high[1], color.orange)
+
+if useZones
+    pruneZones(obDemTop, obDemBot, obDemBar, true)
+    pruneZones(obSupTop, obSupBot, obSupBar, false)
+if useFvg
+    pruneZones(fvDemTop, fvDemBot, fvDemBar, true)
+    pruneZones(fvSupTop, fvSupBot, fvSupBar, false)
+
+obLevelLong  = useZones ? zoneHitLong(obDemTop)  : na
+obLevelShort = useZones ? zoneHitShort(obSupBot) : na
+fvLevelLong  = useFvg   ? zoneHitLong(fvDemTop)  : na
+fvLevelShort = useFvg   ? zoneHitShort(fvSupBot) : na
+obLong  = not na(obLevelLong)
+obShort = not na(obLevelShort)
+fvLong  = not na(fvLevelLong)
+fvShort = not na(fvLevelShort)
+
+// ----------------------------------------------- SESSION 7. opening range
+// The session's first minutes set a range and the break of it is the
+// signal. At most one per side per day by construction, which is the
+// cheapest way to go from many trades to few — and it is anchored to the
+// CLOCK rather than to the pivots everything else here derives from, so
+// its vote is genuinely independent evidence rather than the same
+// observation wearing a different name.
+var float orbHigh = na
+var float orbLow = na
+var bool orbReady = false
+var bool orbLongDone = false
+var bool orbShortDone = false
+
+inOrbWindow = not na(time(timeframe.period, orbSession))
+newDay = ta.change(time("D")) != 0
+
+if newDay
+    orbHigh := na
+    orbLow := na
+    orbReady := false
+    orbLongDone := false
+    orbShortDone := false
+
+if inOrbWindow
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow  := na(orbLow)  ? low  : math.min(orbLow, low)
+else if not na(orbHigh)
+    // The window has closed and a range exists, so it can now be broken.
+    orbReady := true
+
+orbLong  = useOrb and orbReady and not orbLongDone  and not na(orbHigh) and close > orbHigh
+orbShort = useOrb and orbReady and not orbShortDone and not na(orbLow)  and close < orbLow
+if orbLong
+    orbLongDone := true
+if orbShort
+    orbShortDone := true
+
+// -------------------------------------------------- VWAP 8. EMA/VWAP cross
+// The CROSS is the event. "EMA above VWAP" is a state that stays true for
+// hours, and a state in this vote counter is the mistake the trend slot was
+// removed for. ta.vwap resets each session, so this is an intraday reading.
+vwapVal = ta.vwap
+emaVal = ta.ema(close, emaLen)
+evLong  = useEmaVwap and ta.crossover(emaVal, vwapVal)
+evShort = useEmaVwap and ta.crossunder(emaVal, vwapVal)
+
+// ------------------------------------------------- contribution counters
+// "Did this strategy do anything?" is a question the chart should answer
+// rather than one you discover by toggling a switch and squinting at a
+// P&L number. FIRED counts the bars a strategy triggered on. SOLO counts
+// the bars where it was the ONLY one in its family to trigger — the only
+// bars on which it can have changed a decision at all, since a family
+// casts one vote however many of its members agree.
+//
+// A strategy with a healthy FIRED and SOLO of zero is fully subsumed by
+// its family-mates: it costs nothing and contributes nothing. Measured on
+// 269 real daily bars, CHoCH did exactly that — it fired three times and
+// a 20-bar range breakout fired on all three of those bars, because a
+// swing low usually IS the recent range low.
+brkFired   = brkLong   or brkShort
+bosFired   = bosLong   or bosShort
+srFired    = srLong    or srShort
+sweepFired = sweepLong or sweepShort
+obFired    = obLong    or obShort
+fvFired    = fvLong    or fvShort
+orbFired   = orbLong   or orbShort
+evFired    = evLong    or evShort
+
+var int nBrk = 0
+var int nBos = 0
+var int nSr = 0
+var int nSweep = 0
+var int nOb = 0
+var int nFv = 0
+var int nOrb = 0
+var int nEv = 0
+var int sBrk = 0
+var int sBos = 0
+var int sSr = 0
+var int sSweep = 0
+var int sOb = 0
+var int sFv = 0
+var int sOrb = 0
+var int sEv = 0
+
+if barstate.isconfirmed
+    if brkFired
+        nBrk += 1
+        sBrk += bosFired ? 0 : 1
+    if bosFired
+        nBos += 1
+        sBos += brkFired ? 0 : 1
+    if srFired
+        nSr += 1
+        sSr += sweepFired ? 0 : 1
+    if sweepFired
+        nSweep += 1
+        sSweep += srFired ? 0 : 1
+    if obFired
+        nOb += 1
+        sOb += fvFired ? 0 : 1
+    if fvFired
+        nFv += 1
+        sFv += obFired ? 0 : 1
+    if orbFired
+        nOrb += 1
+        // Sole member of its family, so every fire is a solo fire.
+        sOrb += 1
+    if evFired
+        nEv += 1
+        sEv += 1
+
+// ------------------------------------------------- fakeout control gates
+// Displacement: an institutional break leaves a body, a drift across the
+// line is the false-break signature. Close strength: a break closing
+// mid-bar left a long wick against itself.
+displaced = not requireDisplacement or (atrOk and body > displacementAtr * atr)
+barRange = high - low
+closeUp = barRange > 0 ? (close - low) / barRange : 0.5
+closeDn = barRange > 0 ? (high - close) / barRange : 0.5
+strongUp = closeStrength <= 0 or closeUp >= closeStrength
+strongDn = closeStrength <= 0 or closeDn >= closeStrength
+
+structLevelLongRaw  = brkLong  ? rangeHigh : (bosLong  and not na(brokenHigh) ? brokenHigh : na)
+structLevelShortRaw = brkShort ? rangeLow  : (bosShort and not na(brokenLow)  ? brokenLow  : na)
+rawStructLong  = (brkLong  or bosLong)  and displaced and strongUp and not na(structLevelLongRaw)
+rawStructShort = (brkShort or bosShort) and displaced and strongDn and not na(structLevelShortRaw)
+
+// Hold-for-N-bars. The signal is withheld and fires only if price is STILL
+// beyond the level once N bars have printed; a fakeout is gone by then. One
+// break is armed at a time — a second break while one is pending would
+// otherwise overwrite the level being tested and confirm against the wrong
+// number.
+var float armLevel = na
+var int armBar = na
+var int armDir = 0
+
+bool structLong = false
+bool structShort = false
+float structLevelLong = na
+float structLevelShort = na
+
+if holdBars == 0
+    structLong := rawStructLong
+    structShort := rawStructShort
+    structLevelLong := structLevelLongRaw
+    structLevelShort := structLevelShortRaw
+else
+    if na(armBar) and (rawStructLong or rawStructShort)
+        armLevel := rawStructLong ? structLevelLongRaw : structLevelShortRaw
+        armBar := bar_index
+        armDir := rawStructLong ? 1 : -1
+    if not na(armBar) and bar_index - armBar >= holdBars
+        if armDir == 1 and close > armLevel
+            structLong := true
+            structLevelLong := armLevel
+        if armDir == -1 and close < armLevel
+            structShort := true
+            structLevelShort := armLevel
+        // Cleared either way: a break that failed the hold is spent, not
+        // re-tested on every later bar.
+        armBar := na
+        armDir := 0
+        armLevel := na
+
+rejLong    = srLong  or sweepLong
+rejShort   = srShort or sweepShort
+zoneLong   = obLong  or fvLong
+zoneShort  = obShort or fvShort
+sessLong   = orbLong
+sessShort  = orbShort
+vwapLong   = evLong
+vwapShort  = evShort
+
+// ------------------------------------------------------------- votes
+// Per family when capped, per strategy when not. Uncapped is offered to
+// show what the difference costs, not because it is a reasonable setting:
+// correlated signals derived from one set of pivots make the filter looser
+// the more of them you enable.
+longVotesCapped  = (structLong  ? 1 : 0) + (rejLong  ? 1 : 0) + (zoneLong  ? 1 : 0) + (sessLong  ? 1 : 0) + (vwapLong  ? 1 : 0)
+shortVotesCapped = (structShort ? 1 : 0) + (rejShort ? 1 : 0) + (zoneShort ? 1 : 0) + (sessShort ? 1 : 0) + (vwapShort ? 1 : 0)
+longVotesRaw  = (brkLong  ? 1 : 0) + (bosLong  ? 1 : 0) + (srLong  ? 1 : 0) + (sweepLong  ? 1 : 0) + (obLong  ? 1 : 0) + (fvLong  ? 1 : 0) + (orbLong  ? 1 : 0) + (evLong  ? 1 : 0)
+shortVotesRaw = (brkShort ? 1 : 0) + (bosShort ? 1 : 0) + (srShort ? 1 : 0) + (sweepShort ? 1 : 0) + (obShort ? 1 : 0) + (fvShort ? 1 : 0) + (orbShort ? 1 : 0) + (evShort ? 1 : 0)
+longVotes  = capFamilies ? longVotesCapped  : longVotesRaw
+shortVotes = capFamilies ? shortVotesCapped : shortVotesRaw
+
+longOk  = inSession and volOk and volSurgeOk and deltaOkLong and longVotes  >= minConfirmations and (not blockOnOpposition or shortVotes == 0)
+shortOk = inSession and volOk and volSurgeOk and deltaOkShort and shortVotes >= minConfirmations and (not blockOnOpposition or longVotes  == 0)
+
+// The level the trade is measured from, most specific first. A zone edge is
+// a price band someone actually defended; a range high is the loosest of
+// them, so it is the fallback rather than the default.
+float longLevel = na
+if obLong
+    longLevel := obLevelLong
+else if fvLong
+    longLevel := fvLevelLong
+else if (sweepLong or srLong) and not na(lastPL)
+    longLevel := lastPL
+else if orbLong and not na(orbHigh)
+    longLevel := orbHigh
+else if structLong and not na(structLevelLong)
+    longLevel := structLevelLong
+else if evLong and not na(vwapVal)
+    longLevel := vwapVal
+
+float shortLevel = na
+if obShort
+    shortLevel := obLevelShort
+else if fvShort
+    shortLevel := fvLevelShort
+else if (sweepShort or srShort) and not na(lastPH)
+    shortLevel := lastPH
+else if orbShort and not na(orbLow)
+    shortLevel := orbLow
+else if structShort and not na(structLevelShort)
+    shortLevel := structLevelShort
+else if evShort and not na(vwapVal)
+    shortLevel := vwapVal
+
+// ------------------------------------------------------------ entries
+flat = strategy.position_size == 0
+var int pendingSince = na
+var string pendingId = na
+
+alertMsg(string action) =>
+    '{"secret":"' + alertSecret + '","action":"' + action +
+     '","symbol":"{{ticker}}","quantity":' + str.tostring(alertQty) +
+     ',"price":"{{close}}","bar_time":"{{time}}","fired_at":"{{timenow}}"}'
+
+var float plannedStop = na
+canEnter = flat and na(pendingSince) and atrOk and barstate.isconfirmed
+
+if canEnter and longOk and not na(longLevel)
+    limitPrice = longLevel + entryAtrMult * atr
+    // A buy limit at or above the market is a market order wearing a limit
+    // order's name: it fills instantly at the worse price.
+    if limitPrice < close
+        plannedStop := longLevel - stopAtrMult * atr
+        strategy.entry("L", strategy.long, limit=limitPrice, alert_message=alertMsg("buy"))
+        pendingSince := bar_index
+        pendingId := "L"
+
+if canEnter and shortOk and not na(shortLevel)
+    limitPrice = shortLevel - entryAtrMult * atr
+    if limitPrice > close
+        plannedStop := shortLevel + stopAtrMult * atr
+        strategy.entry("S", strategy.short, limit=limitPrice, alert_message=alertMsg("sell"))
+        pendingSince := bar_index
+        pendingId := "S"
+
+// An unfilled order left alive fills in some future bar whose setup has
+// nothing to do with the signal it is attributed to.
+if not na(pendingSince) and strategy.position_size == 0 and bar_index - pendingSince >= orderExpiryBars
+    strategy.cancel(pendingId)
+    pendingSince := na
+    pendingId := na
+    plannedStop := na
+
+if strategy.position_size != 0
+    pendingSince := na
+    pendingId := na
+
+// ----------------------------------------------------- stop management
+var float stopLevel = na
+var float entryR = na
+var float tp1 = na
+var float tp2 = na
+var float tp3 = na
+var bool beLocked = false
+var float runExtreme = na
+
+justOpened = strategy.position_size != 0 and strategy.position_size[1] == 0
+if justOpened
+    entryPrice = strategy.position_avg_price
+    isLong = strategy.position_size > 0
+    rawStop = na(plannedStop) ? (isLong ? entryPrice - stopAtrMult * atr : entryPrice + stopAtrMult * atr) : plannedStop
+    // A limit order fills at its price OR BETTER. Price gapping through a
+    // buy limit can fill the long BELOW its own structural stop, leaving the
+    // stop above the entry — an instant exit that books a loss looking like
+    // the strategy failing when it is an unhandled fill.
+    stopLevel := isLong ? math.min(rawStop, entryPrice - 0.25 * atr) : math.max(rawStop, entryPrice + 0.25 * atr)
+    entryR := math.abs(entryPrice - stopLevel)
+    beLocked := false
+    runExtreme := isLong ? high : low
+    tp1 := isLong ? entryPrice + tp1R * entryR : entryPrice - tp1R * entryR
+    tp2 := isLong ? entryPrice + tp2R * entryR : entryPrice - tp2R * entryR
+    tp3 := isLong ? entryPrice + tp3R * entryR : entryPrice - tp3R * entryR
+    if showTradeLabels
+        label.new(bar_index, isLong ? low : high,
+             (isLong ? "LONG " : "SHORT ") + str.tostring(entryPrice, format.mintick) +
+             "\nSL " + str.tostring(stopLevel, format.mintick) +
+             (useScaledExit ?
+                  "\nTP1 " + str.tostring(tp1, format.mintick) +
+                  "\nTP2 " + str.tostring(tp2, format.mintick) +
+                  "\nTP3 " + str.tostring(tp3, format.mintick)
+                : takeProfitR > 0 ? "\nTP " + str.tostring(isLong ? entryPrice + takeProfitR * entryR : entryPrice - takeProfitR * entryR, format.mintick) : ""),
+             style = isLong ? label.style_label_up : label.style_label_down,
+             color = color.new(isLong ? color.teal : color.maroon, 20),
+             textcolor = color.white, size = size.small)
+
+if strategy.position_size > 0
+    runExtreme := na(runExtreme) ? high : math.max(runExtreme, high)
+    entryPrice = strategy.position_avg_price
+    if not beLocked and not na(entryR) and entryR > 0 and close >= entryPrice + breakevenR * entryR
+        beLocked := true
+        stopLevel := entryPrice
+    if beLocked and atrOk and useTrailing
+        // Trail only ratchets up. A stop that can loosen is not a stop, so
+        // the candidate has to BEAT the current stop by the step before it
+        // is taken. A step of 0 reduces this to a plain ratchet.
+        trailDist = trailUsePoints ? trailPoints : trailAtrMult * atr
+        cand = runExtreme - trailDist
+        if cand >= nz(stopLevel, entryPrice) + trailStepPoints
+            stopLevel := cand
+    tpLong = takeProfitR > 0 and not na(entryR) ? entryPrice + takeProfitR * entryR : na
+    if not na(stopLevel)
+        if not useScaledExit
+            strategy.exit("L-x", from_entry="L", stop=stopLevel, limit=tpLong, alert_message=alertMsg("exit"))
+        else
+            // Each leg carries the stop, so the runner is never left
+            // unprotected once the earlier legs have filled.
+            strategy.exit("L-tp1", from_entry="L", qty_percent=tp1Pct, stop=stopLevel, limit=tp1, alert_message=alertMsg("exit"))
+            strategy.exit("L-tp2", from_entry="L", qty_percent=tp2Pct, stop=stopLevel, limit=tp2, alert_message=alertMsg("exit"))
+            strategy.exit("L-tp3", from_entry="L", stop=stopLevel, limit=tp3, alert_message=alertMsg("exit"))
+
+if strategy.position_size < 0
+    runExtreme := na(runExtreme) ? low : math.min(runExtreme, low)
+    entryPrice = strategy.position_avg_price
+    if not beLocked and not na(entryR) and entryR > 0 and close <= entryPrice - breakevenR * entryR
+        beLocked := true
+        stopLevel := entryPrice
+    if beLocked and atrOk and useTrailing
+        trailDistS = trailUsePoints ? trailPoints : trailAtrMult * atr
+        candS = runExtreme + trailDistS
+        if candS <= nz(stopLevel, entryPrice) - trailStepPoints
+            stopLevel := candS
+    tpShort = takeProfitR > 0 and not na(entryR) ? entryPrice - takeProfitR * entryR : na
+    if not na(stopLevel)
+        if not useScaledExit
+            strategy.exit("S-x", from_entry="S", stop=stopLevel, limit=tpShort, alert_message=alertMsg("exit"))
+        else
+            strategy.exit("S-tp1", from_entry="S", qty_percent=tp1Pct, stop=stopLevel, limit=tp1, alert_message=alertMsg("exit"))
+            strategy.exit("S-tp2", from_entry="S", qty_percent=tp2Pct, stop=stopLevel, limit=tp2, alert_message=alertMsg("exit"))
+            strategy.exit("S-tp3", from_entry="S", stop=stopLevel, limit=tp3, alert_message=alertMsg("exit"))
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    stopLevel := na
+    entryR := na
+    beLocked := false
+    runExtreme := na
+    plannedStop := na
+    tp1 := na
+    tp2 := na
+    tp3 := na
+
+// -------------------------------------------------------------- plots
+plot(useBreakout ? rangeHigh : na, "Range high", color=color.new(color.gray, 50), style=plot.style_linebr)
+plot(useBreakout ? rangeLow : na, "Range low", color=color.new(color.gray, 50), style=plot.style_linebr)
+plot(lastPH, "Swing high", color=color.new(color.orange, 30), style=plot.style_circles)
+plot(lastPL, "Swing low", color=color.new(color.blue, 30), style=plot.style_circles)
+plot(strategy.position_size != 0 ? stopLevel : na, "Stop", color=beLocked ? color.lime : color.red, style=plot.style_linebr)
+
+plotshape(longOk  and flat, "Long signal",  shape.triangleup,   location.belowbar, color.teal,   size=size.tiny)
+plotshape(shortOk and flat, "Short signal", shape.triangledown, location.abovebar, color.maroon, size=size.tiny)
+plotchar(bosLong or bosShort,     "BOS",   "B", location.top, color.new(color.gray, 40), size=size.tiny)
+plotchar(sweepLong or sweepShort, "Sweep", "S", location.bottom, color.new(color.yellow, 30), size=size.tiny)
+plot(useOrb ? orbHigh : na, "ORB high", color=color.new(color.purple, 20), style=plot.style_linebr, linewidth=2)
+plot(useOrb ? orbLow : na, "ORB low", color=color.new(color.purple, 20), style=plot.style_linebr, linewidth=2)
+// A break waiting out its hold. Visible because "why is there no signal
+// on that obvious break" should be answerable from the chart.
+plotchar(not na(armBar), "Break on hold", "·", location.top, color.new(color.aqua, 30), size=size.tiny)
+plot(useEmaVwap ? vwapVal : na, "VWAP", color=color.new(color.white, 40), style=plot.style_linebr)
+plot(useEmaVwap ? emaVal : na, "EMA", color=color.new(color.yellow, 40), style=plot.style_linebr)
+inTrade = strategy.position_size != 0
+plot(inTrade and useScaledExit ? tp1 : na, "TP1", color=color.new(color.lime, 40), style=plot.style_linebr)
+plot(inTrade and useScaledExit ? tp2 : na, "TP2", color=color.new(color.lime, 55), style=plot.style_linebr)
+plot(inTrade and useScaledExit ? tp3 : na, "TP3", color=color.new(color.lime, 70), style=plot.style_linebr)
+
+// A signal whose retest price was already through the market is skipped
+// rather than filled at the market. Marked, because a triangle with no
+// trade after it and nothing explaining why is how a script stops being
+// trusted.
+skippedLong  = canEnter and longOk  and not na(longLevel)  and longLevel  + entryAtrMult * atr >= close
+skippedShort = canEnter and shortOk and not na(shortLevel) and shortLevel - entryAtrMult * atr <= close
+plotshape(skippedLong or skippedShort, "Signal skipped (no retest room)", shape.xcross,
+     location.top, color.new(color.gray, 40), size=size.tiny)
+
+// --------------------------------------------------------- vote table
+// Declared at global scope: Pine does not allow a function declaration
+// inside a conditional block, and putting this one inside `if
+// barstate.islast` is a compile error rather than a subtle bug.
+voteCell(table t, int r, string name, bool l, bool s, bool on) =>
+    table.cell(t, 0, r, name, text_size=size.tiny,
+         text_color=on ? color.gray : color.new(color.gray, 65))
+    table.cell(t, 1, r, not on ? "off" : l ? "LONG" : s ? "SHORT" : "-", text_size=size.tiny,
+         text_color=not on ? color.new(color.gray, 65) : l ? color.teal : s ? color.maroon : color.gray)
+
+// A solo count of zero is the interesting case: the strategy fired but
+// never alone in its family, so it never changed a vote. Coloured rather
+// than left to be spotted.
+statCell(table t, int r, int fired, int solo, bool on) =>
+    txt = not on ? "" : str.tostring(fired) + " / " + str.tostring(solo)
+    col = not on ? color.new(color.gray, 65) : solo == 0 and fired > 0 ? color.orange : color.gray
+    table.cell(t, 2, r, txt, text_size=size.tiny, text_color=col)
+
+var table votes = table.new(position.top_right, 3, 15, border_width=1)
+if barstate.islast
+    table.cell(votes, 0, 0, "Family / strategy", text_size=size.tiny, text_color=color.white)
+    table.cell(votes, 1, 0, str.tostring(longVotes) + "L / " + str.tostring(shortVotes) + "S",
+         text_size=size.tiny, text_color=color.white)
+    table.cell(votes, 2, 0, "fired/solo", text_size=size.tiny, text_color=color.white)
+    voteCell(votes, 1, "STRUCTURE", structLong, structShort, useBreakout or useBos)
+    voteCell(votes, 2, "  range breakout", brkLong, brkShort, useBreakout)
+    statCell(votes, 2, nBrk, sBrk, useBreakout)
+    voteCell(votes, 3, "  BOS", bosLong, bosShort, useBos)
+    statCell(votes, 3, nBos, sBos, useBos)
+    voteCell(votes, 4, "REJECTION", rejLong, rejShort, useSR or useSweep)
+    voteCell(votes, 5, "  S/R pushback", srLong, srShort, useSR)
+    statCell(votes, 5, nSr, sSr, useSR)
+    voteCell(votes, 6, "  liquidity sweep", sweepLong, sweepShort, useSweep)
+    statCell(votes, 6, nSweep, sSweep, useSweep)
+    voteCell(votes, 7, "ZONE", zoneLong, zoneShort, useZones or useFvg)
+    voteCell(votes, 8, "  order block", obLong, obShort, useZones)
+    statCell(votes, 8, nOb, sOb, useZones)
+    voteCell(votes, 9, "  fair value gap", fvLong, fvShort, useFvg)
+    statCell(votes, 9, nFv, sFv, useFvg)
+    voteCell(votes, 10, "SESSION", sessLong, sessShort, useOrb)
+    voteCell(votes, 11, "  opening range", orbLong, orbShort, useOrb)
+    statCell(votes, 11, nOrb, sOrb, useOrb)
+    voteCell(votes, 12, "VWAP", vwapLong, vwapShort, useEmaVwap)
+    voteCell(votes, 13, "  EMA/VWAP cross", evLong, evShort, useEmaVwap)
+    statCell(votes, 13, nEv, sEv, useEmaVwap)
+    table.cell(votes, 0, 14, "Need", text_size=size.tiny, text_color=color.gray)
+    table.cell(votes, 1, 14, str.tostring(minConfirmations) + (capFamilies ? " of 5 families" : " uncapped") +
+         (useTrailing or takeProfitR > 0 ? "" : "  NO EXIT") +
+         (holdBars > 0 ? "  hold " + str.tostring(holdBars) : ""),
+         text_size=size.tiny, text_color=useTrailing or takeProfitR > 0 ? color.gray : color.red)
