@@ -69,6 +69,8 @@ class MultiEngine:
         self._last_gc_ns = 0
         self._gc_every_ns = 5_000_000_000
         self.exit_counts = [0] * len(ExitReason)
+        self.pnl_by_symbol: dict[str, float] = {}
+        self.trades_by_symbol: dict[str, int] = {}
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def enter(self) -> None:
@@ -174,6 +176,9 @@ class MultiEngine:
         self.exit_counts[reason] += 1
         pnl = pos.mtm(px)
         self.risk.realised += pnl
+        s = pos.symbol
+        self.pnl_by_symbol[s] = self.pnl_by_symbol.get(s, 0.0) + pnl
+        self.trades_by_symbol[s] = self.trades_by_symbol.get(s, 0) + 1
         self._pending.append((leg.spec.symbol, pos.token, -pos.side, pos.lots,
                               px, reason.name))
         self._rec(ts_ns, leg.spec.symbol, pos.token, -pos.side, px, pnl, 0,
@@ -198,9 +203,14 @@ class MultiEngine:
             for s, l in self.legs.items())
         ex = " ".join(f"{ExitReason(i).name}={c}"
                       for i, c in enumerate(self.exit_counts) if c)
+        per = "\n".join(
+            f"    {k:<11}{self.trades_by_symbol.get(k,0):>5} trades  "
+            f"{self.pnl_by_symbol.get(k,0.0):>+12,.0f}"
+            for k in self.legs)
         return (f"ticks={self._ticks} events={self._log_n} open[{legs}] "
                 f"net_delta={self.net_delta():+.0f}\n"
                 f"  {self.risk.summary()}\n"
                 f"  exits[{ex or 'none'}]\n"
                 f"  {self.lat_signal.summary()}\n"
-                f"  {self.lat_send.summary()}")
+                f"  {self.lat_send.summary()}\n"
+                f"  per index:\n{per}")
