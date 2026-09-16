@@ -6,12 +6,58 @@ nanosecond-resolution, which is what tick-to-trade has to be measured against.
 
 The histogram is pre-allocated and fixed-width on purpose. Growing a structure
 inside the hot path is an allocation, and an allocation is a GC trigger.
+
+A VIRTUAL clock is available behind HFT_VIRTUAL_CLOCK=1, and it exists because
+of a measurement failure worth recording. Every timing decision in this system
+-- token-bucket refill, the per-contract gap, book staleness, minimum hold --
+reads this clock. Under the real clock those decisions depend on how fast the
+interpreter happened to run, so the same simulation with the same seeds
+produced net results ranging 1,309 to 6,138: a 4.7x spread from nothing but
+scheduler jitter. Every parameter comparison made that way was noise.
+
+Under the virtual clock the driver owns time and the run is bit-reproducible,
+which is the only condition under which comparing two parameter settings means
+anything. Latency histograms go to zero there, because latency is the one thing
+that has to be measured against a real clock -- use `real_ns` for that, and run
+without the env var when latency is what you are measuring.
+
+The binding is decided once, at import. `from .clock import now_ns` copies the
+reference, so switching sources later would silently leave half the system on
+the old one.
 """
 from __future__ import annotations
+import os
 import time
 from typing import Final
 
-now_ns = time.perf_counter_ns          # bind once; attribute lookup is not free
+
+class VirtualClock:
+    """Monotonic, deterministic, advanced only by whoever drives the sim."""
+
+    __slots__ = ("t",)
+
+    def __init__(self, start: int = 1_000_000_000) -> None:
+        self.t = start
+
+    def __call__(self) -> int:
+        return self.t
+
+    def advance(self, ns: int) -> None:
+        self.t += ns
+
+    def reset(self, start: int = 1_000_000_000) -> None:
+        self.t = start
+
+
+real_ns = time.perf_counter_ns         # always the real one, for latency
+VIRTUAL: VirtualClock | None = None
+
+if os.environ.get("HFT_VIRTUAL_CLOCK") == "1":
+    VIRTUAL = VirtualClock()
+    now_ns = VIRTUAL
+else:
+    now_ns = time.perf_counter_ns      # bind once; attribute lookup is not free
+
 wall_ns = time.time_ns
 
 NS_PER_US: Final = 1_000

@@ -47,48 +47,53 @@ class SimFeed:
     def _round(self, x: float) -> float:
         return round(x / self.tick) * self.tick
 
+    def step(self) -> None:
+        """One tick of the world. Synchronous so a deterministic driver can own
+        the clock; `run` is the same thing paced against a real one."""
+        dt = 1.0 / self.hz
+        sd = self.vol * (dt ** 0.5)
+        self.spot *= (1.0 + self.rng.gauss(0.0, sd))
+        t = now_ns()
+        half = self.tick * 0.5
+        self._h(self.u_token, self.spot - half, self.spot + half,
+                self.rng.randint(50, 400), self.rng.randint(50, 400),
+                self.spot, t)
+
+        for c in self.contracts:
+            fair = (bs_call(self.spot, c["strike"], self.t_years, self.iv)
+                    if c["is_call"] else
+                    bs_put(self.spot, c["strike"], self.t_years, self.iv))
+            h = self._hist[c["token"]]
+            h.append((t, fair))
+            if len(h) > 512:
+                del h[:256]
+            # the quote reflects fair value as it was lag_ns ago
+            cutoff = t - self.lag_ns
+            lagged = fair
+            for ts, f in h:
+                if ts <= cutoff:
+                    lagged = f
+                else:
+                    break
+            j = self.rng.gauss(0.0, self.jitter) * self.tick
+            mid = max(self.tick, lagged + j)
+            sp = self.tick * self.rng.choice((2, 2, 3, 4, 6))
+            bid = self._round(mid - sp * 0.5)
+            ask = self._round(mid + sp * 0.5)
+            if bid <= 0.0:
+                bid = self.tick
+            if ask <= bid:
+                ask = bid + self.tick
+            self._h(c["token"], bid, ask,
+                    self.rng.randint(25, 300), self.rng.randint(25, 300),
+                    mid, now_ns())
+
     async def run(self, seconds: float) -> None:
         dt = 1.0 / self.hz
-        steps = int(seconds * self.hz)
-        sd = self.vol * (dt ** 0.5)
-        for _ in range(steps):
+        for _ in range(int(seconds * self.hz)):
             if self._stop:
                 return
-            self.spot *= (1.0 + self.rng.gauss(0.0, sd))
-            t = now_ns()
-            half = self.tick * 0.5
-            self._h(self.u_token, self.spot - half, self.spot + half,
-                    self.rng.randint(50, 400), self.rng.randint(50, 400),
-                    self.spot, t)
-
-            for c in self.contracts:
-                fair = (bs_call(self.spot, c["strike"], self.t_years, self.iv)
-                        if c["is_call"] else
-                        bs_put(self.spot, c["strike"], self.t_years, self.iv))
-                h = self._hist[c["token"]]
-                h.append((t, fair))
-                if len(h) > 512:
-                    del h[:256]
-                # the quote reflects fair value as it was lag_ns ago
-                cutoff = t - self.lag_ns
-                lagged = fair
-                for ts, f in h:
-                    if ts <= cutoff:
-                        lagged = f
-                    else:
-                        break
-                j = self.rng.gauss(0.0, self.jitter) * self.tick
-                mid = max(self.tick, lagged + j)
-                sp = self.tick * self.rng.choice((2, 2, 3, 4, 6))
-                bid = self._round(mid - sp * 0.5)
-                ask = self._round(mid + sp * 0.5)
-                if bid <= 0.0:
-                    bid = self.tick
-                if ask <= bid:
-                    ask = bid + self.tick
-                self._h(c["token"], bid, ask,
-                        self.rng.randint(25, 300), self.rng.randint(25, 300),
-                        mid, now_ns())
+            self.step()
             await asyncio.sleep(dt)
 
     async def stop(self) -> None:
