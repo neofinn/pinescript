@@ -37,6 +37,7 @@ from .scalp import strike_for_delta, breakeven_points
 @dataclass
 class Rules:
     tp_points: float = 2.0          # take profit
+    stop_points: float = 0.0        # 0 = NO STOP, which is the case as stated
     arm_points: float = 1.0         # trail arms once this is reached
     trail_points: float = 0.5       # give-back allowed after arming
     lock_points: float = 0.2        # hard stop parks here once armed
@@ -56,6 +57,7 @@ class Outcome:
     tp_hits: int = 0
     trail_exits: int = 0
     end_exits: int = 0              # forced out at the candle close
+    stop_exits: int = 0
     worst_open: float = 0.0         # deepest adverse excursion held
     costs_points: float = 0.0
 
@@ -109,7 +111,12 @@ def run_candle(px: list[float], rules: Rules, cost_points: float,
                 armed = True
 
             exit_now = False
-            if gain >= rules.tp_points:
+            if rules.stop_points > 0.0 and gain <= -rules.stop_points:
+                # a real stop, for the comparison against strategies that have
+                # one. The rules as specified set this to 0.
+                o.stop_exits += 1
+                exit_now = True
+            elif gain >= rules.tp_points:
                 o.tp_hits += 1
                 exit_now = True
             elif armed and gain <= max(rules.lock_points,
@@ -170,7 +177,7 @@ def simulate(n_candles: int = 20_000, sigma_5m_points: float = 3.13,
     rules = rules or Rules()
     rng = random.Random(seed)
     n = int(rules.candle_s * steps_per_s)
-    pnls, entries, tps, trails, ends, worsts = [], [], [], [], [], []
+    pnls, entries, tps, trails, ends, worsts, stops = [], [], [], [], [], [], []
     for _ in range(n_candles):
         p = path(n, sigma_5m_points, rng, drift_points)
         o = run_candle(p, rules, cost_points, steps_per_s)
@@ -179,10 +186,11 @@ def simulate(n_candles: int = 20_000, sigma_5m_points: float = 3.13,
         tps.append(o.tp_hits)
         trails.append(o.trail_exits)
         ends.append(o.end_exits)
+        stops.append(o.stop_exits)
         worsts.append(o.worst_open)
     pnls_sorted = sorted(pnls)
     m = len(pnls_sorted)
-    tot_tr = sum(tps) + sum(trails) + sum(ends)
+    tot_tr = sum(tps) + sum(trails) + sum(ends) + sum(stops)
     return dict(
         candles=n_candles,
         mean=sum(pnls) / m,
@@ -197,6 +205,7 @@ def simulate(n_candles: int = 20_000, sigma_5m_points: float = 3.13,
         tp_share=sum(tps) / tot_tr if tot_tr else 0.0,
         trail_share=sum(trails) / tot_tr if tot_tr else 0.0,
         end_share=sum(ends) / tot_tr if tot_tr else 0.0,
+        stop_share=sum(stops) / tot_tr if tot_tr else 0.0,
         worst_open=sum(worsts) / m,
         total=sum(pnls),
     )

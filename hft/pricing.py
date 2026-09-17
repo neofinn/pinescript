@@ -113,3 +113,14 @@ def bs_theta_put(s: float, k: float, t: float, iv: float, r: float = 0.065,
     return (-s * exp(-q * t) * pdf * iv / (2.0 * sqrt(t))
             + r * k * exp(-r * t) * norm_cdf(-d2)
             - q * s * exp(-q * t) * norm_cdf(-d1))
+
+
+def bs_gamma(s: float, k: float, t: float, iv: float, r: float = 0.065,
+             q: float = 0.0) -> float:
+    """Same for calls and puts. Convexity is what an OTM strip is buying."""
+    if t <= 0.0 or iv <= 0.0 or s <= 0.0:
+        return 0.0
+    from math import log, sqrt, exp, pi
+    d1 = (log(s / k) + (r - q + 0.5 * iv * iv) * t) / (iv * sqrt(t))
+    pdf = exp(-0.5 * d1 * d1) / sqrt(2.0 * pi)
+    return exp(-q * t) * pdf / (s * iv * sqrt(t))
