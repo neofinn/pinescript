@@ -92,10 +92,68 @@ emaLen     = input.int(50, "EMA length", minval = 1, group = G4)
 useSess    = input.bool(false, "Restrict to a session", group = G4)
 sessSpec   = input.session("0915-1500", "Session", group = G4)
 
+G6 = "6 · Orderflow (APPROXIMATE -- read the note)"
+useFlow = input.bool(false, "Require flow confirmation", group = G6,
+ tooltip = "Splits each sub-bar's volume between buyers and sellers by where " +
+ "it closed in its own range. That is not orderflow, it is an inference " +
+ "from bars. See the header note.")
+ltfSpec = input.timeframe("1", "Sub-bar timeframe", group = G6)
+minImb  = input.float(0.25, "Min |imbalance| = |delta| / volume", minval = 0.0,
+ maxval = 1.0, step = 0.05, group = G6)
+noExhaust = input.bool(false, "Reject bars where flow and price disagree",
+ group = G6)
+
 G5 = "5 · Display"
 showLevels = input.bool(true, "Draw levels", group = G5)
 showDiag   = input.bool(true, "Diagnostics table", group = G5)
 showSkips  = input.bool(true, "Mark skipped signals", group = G5)
+
+// ── orderflow, approximated ───────────────────────────────────────────────
+// REAL orderflow is trade-by-trade with the aggressor side known: who crossed
+// the spread, at what level, against how much resting size. Diagonal
+// imbalance -- ask volume at a price against bid volume one tick below --
+// needs per-level bid/ask volume, and no OHLCV feed carries it. What is
+// available here is the tick rule applied to sub-bars: classify each sub-bar's
+// volume by where it closed in its own range, then sum. Every Pine footprint
+// script does this underneath. It is an inference from bars, not a
+// measurement of flow, and a sub-bar that closes at its high might be one
+// aggressive buy into a thin book or steady accumulation -- this cannot tell
+// them apart.
+//
+// IT NEEDS VOLUME. Indian index symbols (NIFTY, BANKNIFTY, SENSEX) publish NO
+// volume at any timeframe, so on those this gate blocks every signal and the
+// chart looks identical to a broken script. The diagnostics table reports
+// whether volume arrived, for exactly that reason.
+subDelta(arrH, arrL, arrC, arrV) =>
+    float buy = 0.0
+    float sell = 0.0
+    int n = array.size(arrV)
+    if n > 0
+        for i = 0 to n - 1
+            v = array.get(arrV, i)
+            if v > 0
+                h = array.get(arrH, i)
+                l = array.get(arrL, i)
+                c = array.get(arrC, i)
+                r = h - l
+                up = r > 0 ? (c - l) / r : 0.5
+                buy += v * up
+                sell += v * (1.0 - up)
+    [buy, sell]
+
+[sH, sL, sC, sV] = request.security_lower_tf(syminfo.tickerid, ltfSpec,
+ [high, low, close, volume])
+[buyVol, sellVol] = subDelta(sH, sL, sC, sV)
+flowVol = buyVol + sellVol
+flowDelta = buyVol - sellVol
+flowImb = flowVol > 0 ? flowDelta / flowVol : 0.0
+subCount = array.size(sV)
+flowExhaust = (flowDelta > 0 and close < open) or (flowDelta < 0 and close > open)
+
+flowOkL = not useFlow or (flowVol > 0 and flowImb >= minImb and
+ (not noExhaust or not flowExhaust))
+flowOkS = not useFlow or (flowVol > 0 and flowImb <= -minImb and
+ (not noExhaust or not flowExhaust))
 
 // ── measurements ──────────────────────────────────────────────────────────
 atr  = ta.atr(atrLen)
@@ -121,9 +179,12 @@ inSess  = not useSess or not na(time(timeframe.period, sessSpec))
 bullRaw = close > open and loWick <= tol and (not marubozu or upWick <= tol)
 bearRaw = close < open and upWick <= tol and (not marubozu or loWick <= tol)
 
-bullSig = bullRaw and bodyOk and sizeOk and inSess and allowLong and
+// A bar that opened at its low says price never traded lower. It does NOT say
+// buyers were aggressive -- a level can equally be built by passive absorption.
+// The flow gate is the only thing here that separates those two readings.
+bullSig = bullRaw and bodyOk and sizeOk and inSess and allowLong and flowOkL and
  (not useTrend or close > ema)
-bearSig = bearRaw and bodyOk and sizeOk and inSess and allowShort and
+bearSig = bearRaw and bodyOk and sizeOk and inSess and allowShort and flowOkS and
  (not useTrend or close < ema)
 
 // ── level state ───────────────────────────────────────────────────────────
@@ -335,7 +396,7 @@ plot(useTrend ? ema : na, "EMA", color.new(color.gray, 50))
 
 // ── diagnostics ───────────────────────────────────────────────────────────
 // An empty chart and a broken script look the same. This says which.
-var table diagT = table.new(position.top_right, 2, 7,
+var table diagT = table.new(position.top_right, 2, 10,
  border_width = 1, frame_width = 1, frame_color = color.gray)
 
 if showDiag and barstate.islast
@@ -355,6 +416,19 @@ if showDiag and barstate.islast
     table.cell(diagT, 1, 5, str.tostring(nEntries), text_size = size.small)
     table.cell(diagT, 0, 6, "skipped (limit)", text_size = size.small)
     table.cell(diagT, 1, 6, str.tostring(nSkipped), text_size = size.small)
+    table.cell(diagT, 0, 7, "flow gate", text_size = size.small)
+    table.cell(diagT, 1, 7, useFlow ? "ON" : "off", text_size = size.small)
+    table.cell(diagT, 0, 8, "sub-bars / volume", text_size = size.small)
+    // No volume means the gate silently rejects everything, which looks
+    // exactly like a broken script. Say so instead.
+    volOk = flowVol > 0
+    table.cell(diagT, 1, 8, str.tostring(subCount) +
+     (volOk ? "" : "  NO VOLUME"), text_size = size.small,
+     text_color = volOk ? color.gray : color.red)
+    table.cell(diagT, 0, 9, "imbalance", text_size = size.small)
+    table.cell(diagT, 1, 9, str.tostring(flowImb, "#.##"),
+     text_size = size.small,
+     text_color = flowImb > 0 ? color.teal : color.maroon)
 
 // ── alerts ────────────────────────────────────────────────────────────────
 // Strategies use alert(), not alertcondition() -- the latter is indicator-only.

@@ -48,7 +48,8 @@ def backtest(bars, *, tol_mode="pct", tol_pct=5.0, tol_atr=0.05, tol_ticks=0,
              atr_len=14, entry_mode="both", level_life=20, retest_tol=0.10,
              stop_buf=0.25, rr=2.0, use_be=False, allow_long=True,
              allow_short=True, use_trend=False, ema_len=50,
-             cost_points=0.45, optimistic=False):
+             cost_points=0.45, optimistic=False,
+             flow=None, min_imb=0.0, require_no_exhaust=False):
     atr = wilder_atr(bars, atr_len)
     em = ema(bars, ema_len)
     n = len(bars)
@@ -131,9 +132,22 @@ def backtest(bars, *, tol_mode="pct", tol_pct=5.0, tol_atr=0.05, tol_ticks=0,
             elif not size_ok:
                 rej_size += 1
 
-        bull_sig = (bull_raw and body_ok and size_ok and allow_long
+        # orderflow gate. A bullish bar that opened at its low says the price
+        # never traded lower; it does not say buyers were AGGRESSIVE. Those are
+        # different claims, and the flow approximation is the only thing here
+        # that can tell them apart.
+        flow_ok_l = flow_ok_s = True
+        if flow is not None:
+            f = flow[i]
+            if min_imb > 0.0:
+                flow_ok_l = f["imb"] >= min_imb
+                flow_ok_s = f["imb"] <= -min_imb
+            if require_no_exhaust and f["exhaust"]:
+                flow_ok_l = flow_ok_s = False
+
+        bull_sig = (bull_raw and body_ok and size_ok and allow_long and flow_ok_l
                     and (not use_trend or b["c"] > em[i]))
-        bear_sig = (bear_raw and body_ok and size_ok and allow_short
+        bear_sig = (bear_raw and body_ok and size_ok and allow_short and flow_ok_s
                     and (not use_trend or b["c"] < em[i]))
 
         # ── D. level state, then invalidation (this order matters) ────────
