@@ -1,0 +1,366 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  WICKLESS CANDLE
+//
+//  A wickless candle is not really a bar pattern, it is a LEVEL. When a
+//  bullish bar opens at its own low, not one trade printed below the opening
+//  price for the whole period: buyers were there from the first tick and
+//  nobody was allowed to probe lower. That price is where an imbalance began,
+//  and it is the level worth trading -- the bar itself is only how you found
+//  it.
+//
+//  So this does not buy the wickless bar. It marks the level, waits, and takes
+//  either the retest of it or the break of the bar's far end, and treats a
+//  close back through the level as the signal being wrong.
+//
+//  ON TOLERANCE, which decides whether you see any signals at all:
+//  an exactly wickless bar needs the period's first trade to also be its
+//  extreme. On a 1-minute index chart that happens often, because few ticks
+//  print. On a daily chart of a liquid instrument it is rare. Set tolerance to
+//  0 ticks and some symbol/timeframe combinations will show you nothing, which
+//  looks identical to a broken script. The diagnostics table exists for that
+//  reason: it counts what was found and what was rejected, so an empty chart
+//  tells you WHICH filter emptied it.
+//
+//  NOT COMPILED. TradingView is the only Pine compiler and there is none in
+//  the environment this was written in. Reviewed line by line for scope, na
+//  handling, continuation indentation and order/stop interaction, but never
+//  run on a chart. Paste it into the Pine editor and fix what it flags.
+// ═══════════════════════════════════════════════════════════════════════════
+
+strategy("Wickless Candle", "WICKLESS", overlay = true,
+ initial_capital = 500000,
+ default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+ pyramiding = 0, calc_on_every_tick = false, process_orders_on_close = false,
+ commission_type = strategy.commission.percent, commission_value = 0.03,
+ slippage = 2, margin_long = 100, margin_short = 100,
+ max_labels_count = 500, max_lines_count = 500)
+
+// ── detection ─────────────────────────────────────────────────────────────
+G1 = "1 · What counts as wickless"
+tolMode = input.string("Percent of range", "Wick tolerance",
+ options = ["Percent of range", "ATR", "Ticks (strict)"], group = G1,
+ tooltip = "Exact equality is rare on liquid instruments. This is how much " +
+ "wick still counts as none.")
+tolPct   = input.float(5.0, "  · percent of bar range", minval = 0.0,
+ maxval = 50.0, step = 0.5, group = G1)
+tolAtr   = input.float(0.05, "  · x ATR", minval = 0.0, step = 0.01, group = G1)
+tolTicks = input.int(0, "  · ticks", minval = 0, group = G1)
+marubozu = input.bool(false, "Require BOTH ends wickless (marubozu)",
+ group = G1, tooltip = "Off: only the entry-side wick must be absent, which " +
+ "is the tradeable version. On: a true marubozu, far rarer.")
+minBody  = input.float(50.0, "Min body (% of range)", minval = 0.0,
+ maxval = 100.0, group = G1,
+ tooltip = "A doji with no wicks is a nothing-bar, not a signal.")
+minRange = input.float(0.5, "Min range (x ATR)", minval = 0.0, step = 0.1,
+ group = G1)
+atrLen   = input.int(14, "ATR length", minval = 1, group = G1)
+
+// ── entry ─────────────────────────────────────────────────────────────────
+G2 = "2 · Entry"
+entryMode = input.string("Both", "Trigger",
+ options = ["Retest", "Breakout", "Both"], group = G2,
+ tooltip = "Retest: wait for price back at the level. Breakout: take the " +
+ "break of the wickless bar's far end.")
+orderType = input.string("Market next open", "Order",
+ options = ["Market next open", "Limit at level"], group = G2)
+levelLife = input.int(20, "Level stays valid for (bars)", minval = 1,
+ group = G2)
+orderLife = input.int(5, "Cancel unfilled order after (bars)", minval = 1,
+ group = G2, tooltip = "An order left alive fills days later into a setup " +
+ "that no longer exists.")
+retestTol = input.float(0.10, "Retest zone (x ATR)", minval = 0.0, step = 0.05,
+ group = G2)
+
+// ── risk ──────────────────────────────────────────────────────────────────
+G3 = "3 · Risk"
+stopBuf = input.float(0.25, "Stop beyond level (x ATR)", minval = 0.0,
+ step = 0.05, group = G3)
+rr      = input.float(2.0, "Target (R multiple)", minval = 0.1, step = 0.1,
+ group = G3)
+useBE   = input.bool(true, "Move stop to breakeven at 1R", group = G3)
+useTrail = input.bool(false, "Trail after breakeven", group = G3)
+trailAtr = input.float(1.5, "Trail distance (x ATR)", minval = 0.1, step = 0.1,
+ group = G3)
+
+// ── filters ───────────────────────────────────────────────────────────────
+G4 = "4 · Filters"
+allowLong  = input.bool(true, "Longs", group = G4)
+allowShort = input.bool(true, "Shorts", group = G4)
+useTrend   = input.bool(false, "Only in the EMA's direction", group = G4)
+emaLen     = input.int(50, "EMA length", minval = 1, group = G4)
+useSess    = input.bool(false, "Restrict to a session", group = G4)
+sessSpec   = input.session("0915-1500", "Session", group = G4)
+
+G5 = "5 · Display"
+showLevels = input.bool(true, "Draw levels", group = G5)
+showDiag   = input.bool(true, "Diagnostics table", group = G5)
+showSkips  = input.bool(true, "Mark skipped signals", group = G5)
+
+// ── measurements ──────────────────────────────────────────────────────────
+atr  = ta.atr(atrLen)
+ema  = ta.ema(close, emaLen)
+rng  = high - low
+body = math.abs(close - open)
+loWick = math.min(open, close) - low
+upWick = high - math.max(open, close)
+
+tol = switch tolMode
+    "Percent of range" => rng * tolPct / 100.0
+    "ATR"              => nz(atr) * tolAtr
+    => syminfo.mintick * tolTicks
+
+bodyOk  = rng > 0 and body >= rng * minBody / 100.0
+sizeOk  = not na(atr) and rng >= atr * minRange
+inSess  = not useSess or not na(time(timeframe.period, sessSpec))
+
+// The entry-side wick is the one that matters. A bullish bar that opened at
+// its low says nobody sold below the open; an upper wick on the same bar only
+// says the move ran out of steam, which is a different statement and not one
+// that invalidates the level.
+bullRaw = close > open and loWick <= tol and (not marubozu or upWick <= tol)
+bearRaw = close < open and upWick <= tol and (not marubozu or loWick <= tol)
+
+bullSig = bullRaw and bodyOk and sizeOk and inSess and allowLong and
+ (not useTrend or close > ema)
+bearSig = bearRaw and bodyOk and sizeOk and inSess and allowShort and
+ (not useTrend or close < ema)
+
+// ── level state ───────────────────────────────────────────────────────────
+// The level is the bar's LOW (bull) or HIGH (bear), not its open. Within
+// tolerance they are the same price, but the extreme is the one that actually
+// held, so it is the one a stop belongs under.
+var float bullLvl = na
+var float bullTop = na
+var int   bullBar = na
+var float bearLvl = na
+var float bearBot = na
+var int   bearBar = na
+
+var line bullLine = na
+var line bearLine = na
+
+// diagnostics
+var int nBullRaw = 0
+var int nBearRaw = 0
+var int nRejBody = 0
+var int nRejSize = 0
+var int nEntries = 0
+var int nSkipped = 0
+
+if barstate.isconfirmed
+    if bullRaw or bearRaw
+        if not bodyOk
+            nRejBody += 1
+        else if not sizeOk
+            nRejSize += 1
+
+if bullSig and barstate.isconfirmed
+    bullLvl := low
+    bullTop := high
+    bullBar := bar_index
+    nBullRaw += 1
+    if showLevels
+        if not na(bullLine)
+            line.delete(bullLine)
+        bullLine := line.new(bar_index, low, bar_index + levelLife, low,
+         color = color.new(color.teal, 0), width = 2)
+
+if bearSig and barstate.isconfirmed
+    bearLvl := high
+    bearBot := low
+    bearBar := bar_index
+    nBearRaw += 1
+    if showLevels
+        if not na(bearLine)
+            line.delete(bearLine)
+        bearLine := line.new(bar_index, high, bar_index + levelLife, high,
+         color = color.new(color.maroon, 0), width = 2)
+
+// ── invalidation ──────────────────────────────────────────────────────────
+// A close back through the level is the premise failing: someone was willing
+// to trade where nobody would before. Expiry matters as much -- a level from
+// forty bars ago is describing a market that no longer exists.
+bullExpired = not na(bullBar) and bar_index - bullBar > levelLife
+bearExpired = not na(bearBar) and bar_index - bearBar > levelLife
+bullDead = not na(bullLvl) and (close < bullLvl or bullExpired)
+bearDead = not na(bearLvl) and (close > bearLvl or bearExpired)
+
+if bullDead
+    bullLvl := na
+    bullTop := na
+    bullBar := na
+if bearDead
+    bearLvl := na
+    bearBot := na
+    bearBar := na
+
+// ── triggers ──────────────────────────────────────────────────────────────
+wantRetest   = entryMode == "Retest" or entryMode == "Both"
+wantBreakout = entryMode == "Breakout" or entryMode == "Both"
+
+zone = nz(atr) * retestTol
+
+// Retest: the bar must trade INTO the zone and close back OUT of it. A bar
+// that closes inside has not rejected anything, it is still being decided.
+bullRetest = wantRetest and not na(bullLvl) and bar_index > bullBar and
+ low <= bullLvl + zone and close > bullLvl
+bearRetest = wantRetest and not na(bearLvl) and bar_index > bearBar and
+ high >= bearLvl - zone and close < bearLvl
+
+bullBreak = wantBreakout and not na(bullTop) and bar_index > bullBar and
+ close > bullTop
+bearBreak = wantBreakout and not na(bearBot) and bar_index > bearBar and
+ close < bearBot
+
+goLong  = (bullRetest or bullBreak) and strategy.position_size == 0
+goShort = (bearRetest or bearBreak) and strategy.position_size == 0
+
+// ── orders ────────────────────────────────────────────────────────────────
+var float pendStop = na
+var int   pendBar  = na
+
+// A buy limit at or above the market is a market order wearing a disguise: it
+// fills instantly at the worse price. When that is the case the signal is
+// skipped and marked, because a trigger with no trade after it and nothing
+// explaining why is how a script stops being trusted.
+longLimitOk  = orderType == "Market next open" or
+ (not na(bullLvl) and close > bullLvl)
+shortLimitOk = orderType == "Market next open" or
+ (not na(bearLvl) and close < bearLvl)
+
+if goLong and barstate.isconfirmed
+    if longLimitOk
+        lim = orderType == "Limit at level" ? bullLvl : na
+        strategy.entry("L", strategy.long, limit = lim, comment = "wickless")
+        pendStop := bullLvl - nz(atr) * stopBuf
+        pendBar  := bar_index
+        nEntries += 1
+    else
+        nSkipped += 1
+        if showSkips
+            label.new(bar_index, low, "✕", color = color.new(color.gray, 70),
+             style = label.style_label_up, textcolor = color.white,
+             size = size.tiny,
+             tooltip = "buy limit would have filled immediately at a worse " +
+             "price than the level")
+
+if goShort and barstate.isconfirmed
+    if shortLimitOk
+        lim = orderType == "Limit at level" ? bearLvl : na
+        strategy.entry("S", strategy.short, limit = lim, comment = "wickless")
+        pendStop := bearLvl + nz(atr) * stopBuf
+        pendBar  := bar_index
+        nEntries += 1
+    else
+        nSkipped += 1
+        if showSkips
+            label.new(bar_index, high, "✕", color = color.new(color.gray, 70),
+             style = label.style_label_down, textcolor = color.white,
+             size = size.tiny,
+             tooltip = "sell limit would have filled immediately at a worse " +
+             "price than the level")
+
+// unfilled orders do not outlive their setup
+orderStale = strategy.position_size == 0 and not na(pendBar) and
+ bar_index - pendBar > orderLife
+if orderStale
+    strategy.cancel("L")
+    strategy.cancel("S")
+    pendStop := na
+    pendBar  := na
+
+// ── exits ─────────────────────────────────────────────────────────────────
+// A limit order fills at its price OR BETTER. Price gapping through a buy
+// limit can fill a long BELOW its own structural stop, leaving the stop above
+// the entry and booking an instant loss that looks like the strategy failing
+// when it is an unhandled fill. Both stops are clamped to the correct side of
+// the price actually filled.
+var float stopPx = na
+var float targPx = na
+
+justLong  = strategy.position_size > 0 and nz(strategy.position_size[1]) <= 0
+justShort = strategy.position_size < 0 and nz(strategy.position_size[1]) >= 0
+
+if justLong
+    entryPx = strategy.position_avg_price
+    raw = nz(pendStop, entryPx - nz(atr))
+    stopPx := math.min(raw, entryPx - syminfo.mintick)
+    targPx := entryPx + (entryPx - stopPx) * rr
+
+if justShort
+    entryPx = strategy.position_avg_price
+    raw = nz(pendStop, entryPx + nz(atr))
+    stopPx := math.max(raw, entryPx + syminfo.mintick)
+    targPx := entryPx - (stopPx - entryPx) * rr
+
+if strategy.position_size > 0 and not na(stopPx)
+    entryPx = strategy.position_avg_price
+    r1 = entryPx + (entryPx - stopPx)
+    if useBE and high >= r1
+        stopPx := math.max(stopPx, entryPx)
+    if useTrail and high >= r1
+        stopPx := math.max(stopPx, high - nz(atr) * trailAtr)
+    strategy.exit("Lx", "L", stop = stopPx, limit = useTrail ? na : targPx)
+
+if strategy.position_size < 0 and not na(stopPx)
+    entryPx = strategy.position_avg_price
+    r1 = entryPx - (stopPx - entryPx)
+    if useBE and low <= r1
+        stopPx := math.min(stopPx, entryPx)
+    if useTrail and low <= r1
+        stopPx := math.min(stopPx, low + nz(atr) * trailAtr)
+    strategy.exit("Sx", "S", stop = stopPx, limit = useTrail ? na : targPx)
+
+if strategy.position_size == 0
+    stopPx := na
+    targPx := na
+
+// ── drawing ───────────────────────────────────────────────────────────────
+plotshape(bullSig and barstate.isconfirmed, "Wickless bull", shape.triangleup,
+ location.belowbar, color.new(color.teal, 0), size = size.tiny)
+plotshape(bearSig and barstate.isconfirmed, "Wickless bear",
+ shape.triangledown, location.abovebar, color.new(color.maroon, 0),
+ size = size.tiny)
+
+barcolor(bullSig ? color.new(color.teal, 40) :
+ bearSig ? color.new(color.maroon, 40) : na)
+
+plot(strategy.position_size != 0 ? stopPx : na, "Stop", color.new(color.red, 0),
+ style = plot.style_linebr)
+plot(strategy.position_size != 0 and not useTrail ? targPx : na, "Target",
+ color.new(color.green, 0), style = plot.style_linebr)
+
+plot(useTrend ? ema : na, "EMA", color.new(color.gray, 50))
+
+// ── diagnostics ───────────────────────────────────────────────────────────
+// An empty chart and a broken script look the same. This says which.
+var table diagT = table.new(position.top_right, 2, 7,
+ border_width = 1, frame_width = 1, frame_color = color.gray)
+
+if showDiag and barstate.islast
+    table.cell(diagT, 0, 0, "wickless", bgcolor = color.new(color.gray, 70),
+     text_color = color.white, text_size = size.small)
+    table.cell(diagT, 1, 0, timeframe.period, bgcolor = color.new(color.gray, 70),
+     text_color = color.white, text_size = size.small)
+    table.cell(diagT, 0, 1, "bull levels", text_size = size.small)
+    table.cell(diagT, 1, 1, str.tostring(nBullRaw), text_size = size.small)
+    table.cell(diagT, 0, 2, "bear levels", text_size = size.small)
+    table.cell(diagT, 1, 2, str.tostring(nBearRaw), text_size = size.small)
+    table.cell(diagT, 0, 3, "rejected: body", text_size = size.small)
+    table.cell(diagT, 1, 3, str.tostring(nRejBody), text_size = size.small)
+    table.cell(diagT, 0, 4, "rejected: range", text_size = size.small)
+    table.cell(diagT, 1, 4, str.tostring(nRejSize), text_size = size.small)
+    table.cell(diagT, 0, 5, "entries", text_size = size.small)
+    table.cell(diagT, 1, 5, str.tostring(nEntries), text_size = size.small)
+    table.cell(diagT, 0, 6, "skipped (limit)", text_size = size.small)
+    table.cell(diagT, 1, 6, str.tostring(nSkipped), text_size = size.small)
+
+// ── alerts ────────────────────────────────────────────────────────────────
+// Strategies use alert(), not alertcondition() -- the latter is indicator-only.
+if goLong and barstate.isconfirmed and longLimitOk
+    alert("WICKLESS LONG " + syminfo.ticker + " level " +
+     str.tostring(bullLvl, format.mintick), alert.freq_once_per_bar_close)
+if goShort and barstate.isconfirmed and shortLimitOk
+    alert("WICKLESS SHORT " + syminfo.ticker + " level " +
+     str.tostring(bearLvl, format.mintick), alert.freq_once_per_bar_close)
