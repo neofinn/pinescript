@@ -199,3 +199,118 @@ python3 scripts/vp_ablate.py <dir>           # volume ablations
 python3 scripts/vp_robust.py <dir>           # trimming, breadth, sweep
 python3 scripts/vp_confirm.py <dirA> <dirB>  # lag-1 and the second basket
 ```
+
+---
+
+# Part 2 — the two layers combined, and nothing else
+
+Part 1 used orderflow as a *gate* on profile signals, and the execution came
+from outside both: a 2.0 ATR stop and a 1.5R target. ATR is a volatility model,
+not a profile or a flow reading, so that test measured the pair-plus-ATR.
+
+This part removes everything else. No moving average, no RSI, no VWAP, no ATR,
+no time-of-day filter, no volume surge. The constraint reaches the exit, which
+is where these tests usually cheat:
+
+| | comes from |
+|---|---|
+| entry | a profile level **and** a flow condition, both required |
+| stop | one row beyond the structure the trade leans on |
+| target | the next profile level in the trade's direction |
+| flat | session close — a developing profile does not survive the bell |
+| scale unit | value-area width, not ATR |
+
+Five setups, each needing both layers by construction — a level alone fires
+nothing, a flow reading alone fires nothing:
+
+| setup | the claim |
+|---|---|
+| `absorption_at_edge` | aggressive flow into a value edge that doesn't get paid |
+| `delta_breakout` | value break with flow behind it *and* cvd at a session extreme |
+| `lvn_delta_traverse` | crossing a thin price with someone pushing |
+| `cvd_divergence` | new price extreme the flow doesn't confirm, at the value edge |
+| `naked_poc_flow` | flow pointing at an untouched POC |
+
+**The control had to change too.** Randomising entries while keeping an ATR
+stop compares two different machines. Here every control entry borrows a
+(stop distance, target distance) pair from the strategy's *own* realised
+entries in the same window, so the risk geometry is identical and only the
+timing and direction are random. That isolates the question: does the pair of
+layers pick better moments than chance, given the same exits.
+
+## Result: nothing passes
+
+Fifteen cells — five setups × {set A first half, set A second half, set B
+whole}. Set B is the universe swap that killed Part 1's survivor, so it is in
+from the start this time.
+
+| setup | A-IS | A-OOS | B-ALL | PF range | hit rate |
+|---|---|---|---|---|---|
+| absorption_at_edge | 47.3 | 14.7 | 43.0 | 0.71–0.83 | 24–29% |
+| delta_breakout | 84.3 | 14.0 | 60.7 | 0.83–1.18 | 24–32% |
+| lvn_delta_traverse | **2.7** | **2.7** | 79.0 | 0.68–0.86 | 21–23% |
+| cvd_divergence | 89.3 | **100.0** | 63.3 | 0.90–1.23 | 28–33% |
+| naked_poc_flow | 78.0 | 18.0 | 43.7 | 0.81–1.13 | 28–33% |
+
+One cell out of fifteen clears its control, and its own other two windows
+don't. That is what one lucky draw in fifteen looks like.
+
+**Absorption at the value edge is the worst of them** — and it is the most
+cited setup in every orderflow course: PF 0.71–0.83 on a 24–29% hit rate,
+negative median trade in all three windows.
+
+The intrabar tiebreak doesn't rescue anything. Ties are under 1.5% of trades
+and reading them target-first instead of stop-first moves PF by 0.01–0.03, so
+both readings give the same verdict.
+
+**The pure exits performed worse than the borrowed ones.** Part 1's ATR stop
+with a fixed R multiple produced ~46% hit rates; the profile's own levels
+produce 21–33%, because the stop sits one row past structure while the target
+is a whole level away. Making the exit internally consistent did not make it
+better — worth knowing before building a system on the principle that levels
+should define the risk.
+
+## The inversion, which is a trap worth showing
+
+`lvn_delta_traverse` lands at the **2.7th percentile in both set-A windows** —
+consistently worse than random, which is the classic invitation to just trade
+it backwards. Mirroring the geometry so the flip is a fair trade:
+
+| variant | A-IS | A-OOS | B-ALL | PF (A-IS / A-OOS / B) |
+|---|---|---|---|---|
+| as-built | 1.0 | 2.3 | 81.3 | 0.684 / 0.700 / 0.856 |
+| inverted | 65.0 | **99.0** | **96.0** | 0.947 / 1.173 / **0.966** |
+
+The inversion passes two of three windows including the universe swap — and
+**loses money in two of those three**. On set B it sits at the 96th percentile
+with a profit factor of 0.966.
+
+That is the cleanest demonstration in this whole project that *beating the
+control* and *making money* are different questions. The control shares the
+strategy's exit geometry, and that geometry is a net loser after costs, so
+beating it convincingly still hands you a losing system. A percentile is
+evidence that a signal carries information. It is not evidence of profit, and
+neither number substitutes for the other.
+
+## What this says about the combination
+
+The two layers do not rescue each other. Part 1 found the orderflow gate added
+nothing to profile signals; Part 2 finds that setups requiring both layers do
+no better, and the most-taught one does worst. Across both parts the pattern is
+the same: **each added condition cost sample faster than it bought
+selectivity**, and the unfiltered or simplest version was never beaten by a
+more confluent one.
+
+The ceiling is probably the data, not the idea. The delta here is the tick rule
+at r = 0.68 against a 1-minute reconstruction, and the POC moves up to 2.5 ATR
+depending on bar granularity. Absorption in particular is defined on
+per-level bid/ask volume that no OHLCV feed carries — what is tested above is
+the nearest thing that can be built, and it may simply be too blunt. Real
+trades-and-quotes data would answer that; nothing short of it will.
+
+`vp_orderflow_strategy.pine` implements all five setups with the level-based
+exits, defaulting to `none`, with the result in its header.
+
+```
+python3 scripts/vp_of_run.py <dirA> <dirB>   # the 15-cell table
+```
