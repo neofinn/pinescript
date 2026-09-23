@@ -207,4 +207,8 @@ def score(res):
 # widen them if your fills say otherwise.
 COST = {"SPY": 0.01, "QQQ": 0.01, "IWM": 0.01, "DIA": 0.02,
         "XLF": 0.01, "XLE": 0.01, "GC=F": 0.20, "CL=F": 0.02,
-        "NVDA": 0.02, "AAPL": 0.02, "TSLA": 0.03, "AMD": 0.05}
+        "NVDA": 0.02, "AAPL": 0.02, "TSLA": 0.03, "AMD": 0.05,
+        # second cross-section, same basis: one spread crossed each way
+        "MSFT": 0.03, "INTC": 0.01, "META": 0.08, "AMZN": 0.02,
+        "GOOGL": 0.02, "AVGO": 0.10, "PLTR": 0.01, "MU": 0.03,
+        "COIN": 0.10, "NFLX": 0.15, "MSTR": 0.15, "SMCI": 0.03}

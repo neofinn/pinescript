@@ -1,0 +1,296 @@
+//@version=6
+// Volume Profile + Orderflow
+//
+// Two layers that are usually sold together and are not the same thing:
+//
+//   VOLUME PROFILE   where volume traded, by price. POC, value area, and the
+//                    high/low volume nodes inside it.
+//   ORDERFLOW        which side was aggressing, by time. Delta, cumulative
+//                    delta, and the price/delta disagreements.
+//
+// Both are built from 1-minute sub-bars via request.security_lower_tf, which
+// is as close to real as a TradingView chart gets. Read the header of the
+// DATA HONESTY section before trusting the delta: it is the tick rule, not
+// the aggressor flag, and the difference is measurable.
+//
+// Backtest result for the mechanical version of this, in the repo docs: the
+// value-area fade cleared a matched random control on the ten largest US
+// names and FAILED on the next ten over identical dates. Use these levels as
+// context. The repo does not have evidence they work as an automatic entry.
+
+indicator("Volume Profile + Orderflow", overlay = true,
+  max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ── inputs ───────────────────────────────────────────────────────────────
+gP = "Profile"
+rows      = input.int(48,   "Rows",               1, 200,  group = gP)
+vaPct     = input.float(70, "Value area %",       50, 95,  group = gP)
+showDev   = input.bool(true,  "Developing (today)",         group = gP)
+showPrior = input.bool(true,  "Prior session levels",       group = gP)
+showNodes = input.bool(true,  "High / low volume nodes",    group = gP)
+nodeK     = input.float(1.5, "Node threshold (x mean row)", 1.0, 4.0, group = gP)
+updEvery  = input.int(3, "Recompute every N bars", 1, 20,  group = gP,
+  tooltip = "The profile is exact only on the bars where it is rebuilt. " +
+            "1 is exact and slow; 3 is the usual compromise.")
+
+gF = "Orderflow"
+showDelta = input.bool(true,  "Delta columns",              group = gF)
+showCVD   = input.bool(false, "Cumulative session delta",   group = gF)
+imbLevel  = input.float(0.35, "Imbalance mark", 0.0, 1.0,   group = gF)
+markAbs   = input.bool(true,  "Mark absorption",            group = gF)
+
+gS = "Signals"
+sigMode = input.string("off", "Signal", options = ["off", "VA fade", "VA break"],
+  group = gS, tooltip = "Off by default. See the note at the top of this file.")
+
+lowerTF = input.timeframe("1", "Sub-bar timeframe", group = "Data")
+
+// ── data: sub-bars ───────────────────────────────────────────────────────
+// DATA HONESTY
+// request.security_lower_tf gives real 1-minute OHLCV inside this bar. What no
+// chart feed gives is the AGGRESSOR: which side crossed the spread. The delta
+// below is the tick rule -- a sub-bar closing near its high is counted as
+// buying. Against a 1-minute reconstruction this proxy correlated r = 0.68
+// with the finer measure on the ten largest US names, so it carries about
+// half the variance of the thing it stands in for. Treat a small delta
+// reading as noise.
+[sH, sL, sC, sV] = request.security_lower_tf(syminfo.tickerid, lowerTF,
+  [high, low, close, volume])
+
+newSes = timeframe.change("D")
+
+// per-bar delta from the sub-bars
+barBuy  = 0.0
+barSell = 0.0
+if array.size(sV) > 0
+    for i = 0 to array.size(sV) - 1
+        v = array.get(sV, i)
+        h = array.get(sH, i)
+        l = array.get(sL, i)
+        c = array.get(sC, i)
+        rg = h - l
+        up = rg > 0 ? (c - l) / rg : 0.5
+        barBuy  += v * up
+        barSell += v * (1 - up)
+delta = barBuy - barSell
+barVol = barBuy + barSell
+imb = barVol > 0 ? delta / barVol : 0.0
+
+var float cvd = 0.0
+cvd := newSes ? delta : cvd + delta
+
+// ── session sub-bar store ────────────────────────────────────────────────
+// Kept so the profile can be re-binned when the session range expands. A
+// profile anchored to a grid that never moves would put today's first hour in
+// the wrong rows once price leaves it.
+var array<float> pH = array.new_float()
+var array<float> pL = array.new_float()
+var array<float> pV = array.new_float()
+
+if newSes
+    array.clear(pH)
+    array.clear(pL)
+    array.clear(pV)
+
+if array.size(sV) > 0
+    for i = 0 to array.size(sV) - 1
+        array.push(pH, array.get(sH, i))
+        array.push(pL, array.get(sL, i))
+        array.push(pV, array.get(sV, i))
+
+// ── profile construction ─────────────────────────────────────────────────
+// Volume is spread across each sub-bar's range in proportion to how much of
+// that range falls in each row. This is what TradingView's own profile does
+// without tick data, and it is an assumption, not a measurement: rebuilt from
+// 1-minute instead of 5-minute bars the POC moved a median 0.23 ATR, and
+// 2.56 ATR at the 90th percentile. The level is not stable to one decimal.
+build(array<float> aH, array<float> aL, array<float> aV, int nRows,
+      float vaFrac) =>
+    n = array.size(aV)
+    float lo = na
+    float hi = na
+    float poc = na
+    float vah = na
+    float val = na
+    array<float> hist = array.new_float(nRows, 0.0)
+    if n > 0
+        lo := array.min(aL)
+        hi := array.max(aH)
+        w = (hi - lo) / nRows
+        if w > 0
+            for i = 0 to n - 1
+                v = array.get(aV, i)
+                if v > 0
+                    bl = array.get(aL, i)
+                    bh = array.get(aH, i)
+                    a = math.max(0, math.min(nRows - 1, int((bl - lo) / w)))
+                    b = math.max(0, math.min(nRows - 1, int((bh - lo) / w)))
+                    // a <= b always, so this loop never runs backwards --
+                    // Pine counts DOWN when `to` is below `from`, which turns
+                    // an empty range into a silent wrong answer.
+                    // No overflow handling is needed here because lo/hi come
+                    // from these same sub-bars, so nothing can fall outside
+                    // the grid. Against a FIXED grid it could, and clamping
+                    // the index alone would drop that volume without a trace.
+                    span = bh - bl
+                    if span <= 0
+                        array.set(hist, a, array.get(hist, a) + v)
+                    else
+                        for k = a to b
+                            s = lo + k * w
+                            e = s + w
+                            ov = math.min(bh, e) - math.max(bl, s)
+                            if ov > 0
+                                array.set(hist, k, array.get(hist, k) + v * ov / span)
+            // value area: expand from the POC taking the heavier pair. This
+            // is the CBOT rule and it is why the area is asymmetric -- a
+            // standard deviation is a different object and does not match.
+            total = array.sum(hist)
+            pi = array.indexof(hist, array.max(hist))
+            acc = array.get(hist, pi)
+            loI = pi
+            hiI = pi
+            target = total * vaFrac
+            while acc < target and (loI > 0 or hiI < nRows - 1)
+                up = hiI < nRows - 1 ? array.get(hist, hiI + 1) +
+                     (hiI + 2 < nRows ? array.get(hist, hiI + 2) : 0.0) : -1.0
+                dn = loI > 0 ? array.get(hist, loI - 1) +
+                     (loI - 2 >= 0 ? array.get(hist, loI - 2) : 0.0) : -1.0
+                if up >= dn and hiI < nRows - 1
+                    for _r = 1 to math.min(2, nRows - 1 - hiI)
+                        hiI += 1
+                        acc += array.get(hist, hiI)
+                else if loI > 0
+                    for _r = 1 to math.min(2, loI)
+                        loI -= 1
+                        acc += array.get(hist, loI)
+                else
+                    break
+            poc := lo + (pi + 0.5) * w
+            val := lo + loI * w
+            vah := lo + (hiI + 1) * w
+    [hist, lo, hi, poc, vah, val]
+
+doUpdate = barstate.islast or newSes or bar_index % updEvery == 0
+
+var array<float> dHist = array.new_float(rows, 0.0)
+var float dLo = na
+var float dHi = na
+var float dPOC = na
+var float dVAH = na
+var float dVAL = na
+
+if doUpdate and array.size(pV) > 0
+    [h_, lo_, hi_, p_, a_, b_] = build(pH, pL, pV, rows, vaPct / 100.0)
+    dHist := h_
+    dLo := lo_
+    dHi := hi_
+    dPOC := p_
+    dVAH := a_
+    dVAL := b_
+
+// prior session levels: frozen at the open, so there is no question of the
+// level moving under a signal that already used it
+var float ppoc = na
+var float pvah = na
+var float pval = na
+if newSes and not na(dPOC)
+    ppoc := dPOC
+    pvah := dVAH
+    pval := dVAL
+
+// ── drawing ──────────────────────────────────────────────────────────────
+var array<box> devBoxes = array.new<box>()
+var line lPOC = na
+var line lVAH = na
+var line lVAL = na
+var line lPP = na
+var line lPH = na
+var line lPL = na
+
+if barstate.islast
+    // the size guard is not decoration: `for i = 0 to -1` counts DOWN in
+    // Pine and would delete index -1
+    if array.size(devBoxes) > 0
+        for i = 0 to array.size(devBoxes) - 1
+            box.delete(array.get(devBoxes, i))
+    array.clear(devBoxes)
+
+    if showDev and not na(dLo) and dHi > dLo
+        w = (dHi - dLo) / rows
+        mx = array.max(dHist)
+        mean = array.avg(dHist)
+        left = bar_index - 1
+        for k = 0 to rows - 1
+            v = array.get(dHist, k)
+            if v > 0 and mx > 0
+                len = math.max(1, int(60 * v / mx))
+                mid = dLo + (k + 0.5) * w
+                inVA = mid >= dVAL and mid <= dVAH
+                col = inVA ? color.new(color.teal, 70) : color.new(color.gray, 80)
+                if showNodes and v > mean * nodeK
+                    col := color.new(color.orange, 55)
+                if showNodes and v < mean / nodeK
+                    col := color.new(color.blue, 85)
+                array.push(devBoxes, box.new(left - len, dLo + (k + 1) * w,
+                  left, dLo + k * w, border_width = 0, bgcolor = col))
+
+    if showDev and not na(dPOC)
+        line.delete(lPOC)
+        line.delete(lVAH)
+        line.delete(lVAL)
+        lPOC := line.new(bar_index - 60, dPOC, bar_index + 10, dPOC,
+          color = color.red, width = 2)
+        lVAH := line.new(bar_index - 60, dVAH, bar_index + 10, dVAH,
+          color = color.teal, style = line.style_dashed)
+        lVAL := line.new(bar_index - 60, dVAL, bar_index + 10, dVAL,
+          color = color.teal, style = line.style_dashed)
+
+    if showPrior and not na(ppoc)
+        line.delete(lPP)
+        line.delete(lPH)
+        line.delete(lPL)
+        lPP := line.new(bar_index - 90, ppoc, bar_index + 10, ppoc,
+          color = color.new(color.purple, 20), width = 2)
+        lPH := line.new(bar_index - 90, pvah, bar_index + 10, pvah,
+          color = color.new(color.purple, 55), style = line.style_dotted)
+        lPL := line.new(bar_index - 90, pval, bar_index + 10, pval,
+          color = color.new(color.purple, 55), style = line.style_dotted)
+
+// ── orderflow marks ──────────────────────────────────────────────────────
+plot(showDelta ? delta : na, "Delta", style = plot.style_columns,
+  color = delta >= 0 ? color.new(color.teal, 40) : color.new(color.red, 40),
+  display = display.data_window)
+plot(showCVD ? cvd : na, "Cumulative delta", color = color.orange,
+  display = display.data_window)
+
+strongImb = math.abs(imb) >= imbLevel
+// absorption: flow one way, price the other. Not observed -- inferred from
+// disagreement -- which is the weakest of the three readings here.
+absorb = markAbs and strongImb and
+  ((delta > 0 and close < open) or (delta < 0 and close > open))
+plotshape(absorb, "Absorption", shape.diamond,
+  delta > 0 ? location.abovebar : location.belowbar,
+  delta > 0 ? color.new(color.red, 30) : color.new(color.teal, 30), size = size.tiny)
+
+barcolor(strongImb ? (delta > 0 ? color.new(color.teal, 55)
+   : color.new(color.red, 55)) : na)
+
+// ── signals, off by default ──────────────────────────────────────────────
+inDev = not na(dVAH) and not na(dVAL)
+fadeShort = inDev and high > dVAH and close < dVAH
+fadeLong  = inDev and low  < dVAL and close > dVAL
+brkLong   = inDev and close > dVAH and close[1] <= nz(dVAH[1], dVAH)
+brkShort  = inDev and close < dVAL and close[1] >= nz(dVAL[1], dVAL)
+
+sigLong  = sigMode == "VA fade" ? fadeLong  : sigMode == "VA break" ? brkLong  : false
+sigShort = sigMode == "VA fade" ? fadeShort : sigMode == "VA break" ? brkShort : false
+
+plotshape(sigLong,  "Long",  shape.triangleup,   location.belowbar,
+  color.new(color.teal, 20), size = size.tiny)
+plotshape(sigShort, "Short", shape.triangledown, location.abovebar,
+  color.new(color.red, 20),  size = size.tiny)
+
+alertcondition(sigLong,  "VP long",  "Volume profile long")
+alertcondition(sigShort, "VP short", "Volume profile short")
+alertcondition(absorb,   "Absorption", "Absorption at level")
