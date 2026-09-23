@@ -39,7 +39,19 @@ from hft.pricing import bs_call, bs_put, bs_delta_call, bs_delta_put
 YEAR = 365.0 * 24 * 3600
 RF = 0.04                       # US risk-free; the hft default is an INR rate
 CLOSE_UTC = 20 * 3600           # 16:00 ET
-STRIKE_STEP = 1.0               # SPY and QQQ both list $1 strikes
+
+# Per-instrument contract terms. These are not cosmetic: an ES option is
+# $50 a point against SPY's $100 a point with strikes five points apart
+# instead of one, and its at-the-money spread is a quarter point -- $12.50
+# a round trip against SPY's $2. Running ES on SPY's numbers would flatter
+# it by roughly six times on cost alone.
+CONTRACT = {
+    "SPY": dict(mult=100.0, step=1.0,  spread=0.02, comm=0.65),
+    "QQQ": dict(mult=100.0, step=1.0,  spread=0.02, comm=0.65),
+    # ES: CME lists daily expiries; ticks are 0.05 pt under 5.00 premium.
+    # Commission is exchange + clearing + broker, per side.
+    "ES":  dict(mult=50.0,  step=5.0,  spread=0.25, comm=1.25),
+}
 
 
 def price(is_call, s, k, t, iv):
@@ -51,12 +63,12 @@ def delta_of(is_call, s, k, t, iv):
             else bs_delta_put(s, k, t, iv, RF))
 
 
-def pick_strike(is_call, s, t, iv, target):
+def pick_strike(is_call, s, t, iv, target, step):
     """Nearest listed strike to the target delta, searched outward from ATM."""
     best = None
-    base = round(s / STRIKE_STEP) * STRIKE_STEP
+    base = round(s / step) * step
     for i in range(-40, 41):
-        k = base + i * STRIKE_STEP
+        k = base + i * step
         if k <= 0:
             continue
         d = abs(delta_of(is_call, s, k, t, iv))
@@ -84,7 +96,7 @@ def iv_for(vol, ts, mult):
     return v / 100.0 * mult
 
 
-def run_options(st, plan, vol, cfg, lo, hi):
+def run_options(st, plan, vol, cfg, lo, hi, spec):
     """Walk the plan, trading one option position at a time.
 
     Exit rules are on the UNDERLYING: the profile stop, the 1:2 target, or the
@@ -111,10 +123,12 @@ def run_options(st, plan, vol, cfg, lo, hi):
             if spot is not None:
                 t = max(0.0, (pos["expiry"] - b["t"]) / YEAR)
                 px = price(pos["call"], spot, pos["k"], t, pos["iv"])
-                gross = (px - pos["prem"]) * 100 * pos["qty"]
-                cost = (cfg["spread"] * 100 + cfg["comm"] * 2) * pos["qty"]
+                m = spec["mult"]
+                gross = (px - pos["prem"]) * m * pos["qty"]
+                cost = (spec["spread"] * cfg["sp_mult"] * m
+                        + spec["comm"] * 2) * pos["qty"]
                 trades.append(dict(pnl=gross - cost, why=why, qty=pos["qty"],
-                                   prem=pos["prem"] * 100 * pos["qty"],
+                                   prem=pos["prem"] * m * pos["qty"],
                                    exit_px=px, entry_px=pos["prem"],
                                    risk=pos["risk"], side=sd, t_in=pos["t"],
                                    t_out=b["t"], under_r=abs(spot - pos["spot"])))
@@ -138,21 +152,25 @@ def run_options(st, plan, vol, cfg, lo, hi):
                 continue
             iv = iv_for(vol, bars[i + 1]["t"], cfg["iv_mult"])
             call = sd > 0
-            k, d = pick_strike(call, e, t0, iv, cfg["delta"])
+            k, d = pick_strike(call, e, t0, iv, cfg["delta"], spec["step"])
             prem = price(call, e, k, t0, iv)
-            if prem <= 0.02:                 # unquotable; a real book has none
+            # below one tick there is no quote to lift; a model price of a
+            # cent on a contract nobody makes a market in is not a fill
+            if prem <= spec["spread"]:
                 geo += 1
                 continue
             # ex-ante loss at the stop, after an ASSUMED hold. Entry-time
             # information only -- using the real hold would be look-ahead.
             t_then = max(0.0, t0 - cfg["hold"] / YEAR)
             px_stop = price(call, stop, k, t_then, iv)
-            loss = (prem - px_stop) * 100 + cfg["spread"] * 100 + cfg["comm"] * 2
+            m = spec["mult"]
+            loss = ((prem - px_stop) * m
+                    + spec["spread"] * cfg["sp_mult"] * m + spec["comm"] * 2)
             if loss <= 0:
                 geo += 1
                 continue
             qty = int(cfg["risk_$"] // loss)
-            cap = int(cfg["equity"] * cfg["max_prem"] // (prem * 100))
+            cap = int(cfg["equity"] * cfg["max_prem"] // (prem * m))
             qty = max(0, min(qty, cap))
             if qty < 1:
                 geo += 1
@@ -191,17 +209,35 @@ def stats(trades, equity0):
 
 
 # ── harness ──────────────────────────────────────────────────────────────
-SYMS = ("SPY", "VIX"), ("QQQ", "VXN")
-BASE = dict(dte=0, delta=0.50, iv_mult=1.0, hold=45 * 60, spread=0.02,
-            comm=0.65, risk_="", equity=100_000.0, max_prem=0.25)
+SYMS = ("SPY", "VIX"), ("QQQ", "VXN"), ("ES", "VIX")
+BASE = dict(dte=0, delta=0.50, iv_mult=1.0, hold=45 * 60, sp_mult=1.0,
+            equity=100_000.0, max_prem=0.25)
 BASE["risk_$"] = 1000.0
+
+
+def month_window(bars, year, month):
+    """Bar index range covering one calendar month.
+
+    The profile STATE is built on the whole series so the first session of the
+    month still has a prior session behind it. Only the trading is windowed --
+    warming up inside the window would hand the month a few sessions with no
+    levels and call that a result.
+    """
+    lo = hi = None
+    for i, b in enumerate(bars):
+        d = dt.datetime.utcfromtimestamp(b["t"])
+        if d.year == year and d.month == month:
+            if lo is None:
+                lo = i
+            hi = i + 1
+    return lo, hi
 
 
 def signals_for(st, name):
     if name == "dva_edge_fade":
-        # Part 1's best profile-only signal, carried over for comparison.
-        # It has no stop of its own, so it borrows the structure the pure
-        # setups use: one row past the bar that pierced the edge.
+        # Part 1's best profile-only signal. It has no stop of its own, so it
+        # borrows the structure the pure setups use: one row past the bar
+        # that pierced the edge.
         out = []
         for i in range(st["n"]):
             vah, val, row = st["dvah"][i], st["dval"][i], st["row"][i]
@@ -219,23 +255,21 @@ def signals_for(st, name):
     return [fn(st, i) for i in range(st["n"])]
 
 
-def control(st, plan, vol, cfg, count, seed, draws=200):
+def control(st, plan, vol, cfg, spec, count, lo, hi, seed, draws=200):
     """Random timing and direction, the strategy's own stop distances."""
-    dists = []
-    for i, p in enumerate(plan):
-        if p is not None and p[1] is not None:
-            dists.append(abs(st["bars"][i]["c"] - p[1]))
+    dists = [abs(st["bars"][i]["c"] - p[1]) for i, p in enumerate(plan)
+             if p is not None and p[1] is not None and lo <= i < hi]
     if not dists or count < 5:
         return None
     rng = random.Random(seed)
     out = []
     for _ in range(draws):
         rp = [None] * st["n"]
-        for i in range(st["n"] - 1):
+        for i in range(lo, min(hi, st["n"] - 1)):
             sd = rng.choice((-1, 1))
             c = st["bars"][i]["c"]
             rp[i] = (sd, c - sd * dists[rng.randrange(len(dists))], None)
-        tr, _ = run_options(st, rp, vol, cfg, 0, st["n"])
+        tr, _ = run_options(st, rp, vol, cfg, lo, hi, spec)
         rng.shuffle(tr)
         tr = tr[:count]
         if len(tr) < count:
@@ -249,114 +283,113 @@ def control(st, plan, vol, cfg, count, seed, draws=200):
     return out
 
 
+def run_all(st, vols, sigs, nm, cfg, win):
+    allt, counts = [], {}
+    for sym, _ in SYMS:
+        lo, hi = win[sym]
+        if lo is None:
+            continue
+        tr, _ = run_options(st[sym], sigs[sym][nm], vols[sym], cfg, lo, hi,
+                            CONTRACT[sym])
+        counts[sym] = len(tr)
+        for t in tr:
+            t["sym"] = sym
+        allt += tr
+    allt.sort(key=lambda t: t["t_in"])
+    return allt, counts
+
+
 def main():
-    data = sys.argv[1]
-    voldir = sys.argv[2]
-    st, vols = {}, {}
+    data, voldir = sys.argv[1], sys.argv[2]
+    year = int(sys.argv[3]) if len(sys.argv) > 3 else 2026
+    month = int(sys.argv[4]) if len(sys.argv) > 4 else 8
+    st, vols, win = {}, {}, {}
     for sym, vx in SYMS:
         st[sym] = P.state(json.load(open(os.path.join(data, f"{sym}.json"))))
         vols[sym] = json.load(open(os.path.join(voldir, f"{vx}.json")))
+        win[sym] = month_window(st[sym]["bars"], year, month)
 
     names = ["dva_edge_fade"] + list(P.REGISTRY)
     sigs = {sym: {nm: signals_for(st[sym], nm) for nm in names} for sym in st}
 
-    print("SPY + QQQ, bought options, 1:2 on the underlying, $100k, 1% risk")
-    print(f"base: 0DTE, {BASE['delta']:.2f} delta, IV = VIX/VXN, "
-          f"${BASE['spread']:.2f} spread, ${BASE['comm']:.2f}/contract\n")
+    print(f"SPY + QQQ + ES, 0DTE bought options, 1:2 on the underlying, "
+          f"$100k, 1% risk")
+    print(f"window: {year}-{month:02d} only")
+    for sym, _ in SYMS:
+        lo, hi = win[sym]
+        ses = len({dt.datetime.utcfromtimestamp(b["t"]).date()
+                   for b in st[sym]["bars"][lo:hi]}) if lo is not None else 0
+        c = CONTRACT[sym]
+        print(f"  {sym:<4} {ses:>3} sessions, {hi - lo:>5} bars   "
+              f"x{c['mult']:.0f}/pt, {c['step']:.0f}-pt strikes, "
+              f"{c['spread']} spread, ${c['comm']}/side")
+    print()
     print(f"{'setup':<20}{'n':>5}{'PF':>7}{'win%':>6}{'net $':>10}{'final $':>10}"
-          f"{'maxDD%':>8}{'med $':>8}{'opt RR':>8}{'ctl95':>7}{'pct':>6}")
+          f"{'maxDD%':>8}{'med $':>8}{'optRR':>7}{'ctl95':>7}{'pct':>6}")
     rows = []
     for nm in names:
-        allt, counts = [], {}
-        for sym, _ in SYMS:
-            cfg = dict(BASE)
-            tr, geo = run_options(st[sym], sigs[sym][nm], vols[sym], cfg,
-                                  0, st[sym]["n"])
-            counts[sym] = len(tr)
-            allt += tr
-        allt.sort(key=lambda t: t["t_in"])
+        allt, counts = run_all(st, vols, sigs, nm, dict(BASE), win)
         s = stats(allt, BASE["equity"])
         if s is None:
             print(f"{nm:<20}   no trades"); continue
-        dist = []
+        dists = []
         for sym, _ in SYMS:
+            lo, hi = win[sym]
+            if lo is None or counts.get(sym, 0) < 5:
+                continue
             d = control(st[sym], sigs[sym][nm], vols[sym], dict(BASE),
-                        counts[sym], seed=abs(hash((nm, sym))) % 10**6)
+                        CONTRACT[sym], counts[sym], lo, hi,
+                        seed=abs(hash((nm, sym))) % 10 ** 6)
             if d:
-                dist.append(d)
+                dists.append(d)
         c95 = pct = float("nan")
-        if len(dist) == 2:
-            merged = sorted((a + b) / 2 for a, b in zip(dist[0], dist[1]))
+        if dists:
+            merged = sorted(sum(v) / len(v) for v in zip(*dists))
             c95 = merged[int(len(merged) * 0.95)]
             pct = 100.0 * sum(1 for v in merged if v < s["pf"]) / len(merged)
-        rows.append(dict(setup=nm, **s, c95=c95, pct=pct))
+        rows.append(dict(setup=nm, per_sym=counts, **s, c95=c95, pct=pct))
         print(f"{nm:<20}{s['n']:>5}{s['pf']:>7.3f}{s['win']:>6.1f}"
               f"{s['net']:>10,.0f}{s['final']:>10,.0f}{s['dd']:>8.1f}"
-              f"{s['med']:>8,.0f}{s['rr']:>8.2f}{c95:>7.2f}{pct:>6.1f}",
+              f"{s['med']:>8,.0f}{s['rr']:>7.2f}{c95:>7.2f}{pct:>6.1f}",
               flush=True)
-    json.dump(rows, open(os.path.join(data, "vp_options.json"), "w"),
-              indent=1, default=str)
-    return st, vols, sigs, names
+
+    print(f"\n== per instrument ==")
+    print(f"{'setup':<20}{'SPY n':>7}{'SPY $':>10}{'QQQ n':>7}{'QQQ $':>10}"
+          f"{'ES n':>7}{'ES $':>10}")
+    for nm in names:
+        allt, counts = run_all(st, vols, sigs, nm, dict(BASE), win)
+        cells = []
+        for sym, _ in SYMS:
+            t = [x for x in allt if x["sym"] == sym]
+            cells.append(f"{len(t):>7}")
+            cells.append(f"{sum(x['pnl'] for x in t):>10,.0f}")
+        print(f"{nm:<20}{''.join(cells)}")
+
+    json.dump(rows, open(os.path.join(data, f"vp_opt_{year}{month:02d}.json"),
+                         "w"), indent=1, default=str)
+    return st, vols, sigs, names, win
 
 
-
-
-def sweep(st, vols, sigs, names):
-    """The assumptions that are not measurements, moved one at a time.
-
-    IV matters most and is the least pinned down: VIX and VXN are 30-day
-    implied vols and these are same-day options. Real 0DTE at-the-money IV
-    runs below the 30-day figure on quiet days and far above it around events,
-    so a result that only survives at one multiplier is a result about the
-    multiplier.
-    """
+def sweep(st, vols, sigs, names, win):
+    """The assumptions that are not measurements, moved one at a time."""
     axes = (("iv_mult", (0.7, 0.85, 1.0, 1.25, 1.5)),
-            ("dte", (0, 1, 2, 5)),
             ("delta", (0.60, 0.50, 0.40, 0.30)),
-            ("spread", (0.01, 0.02, 0.05, 0.10)))
+            ("sp_mult", (0.5, 1.0, 2.0, 4.0)))
     for axis, vals in axes:
-        print(f"\n== {axis} ==")
-        head = "".join(f"{v:>9}" for v in vals)
-        print(f"{'setup':<20}{head}      (net $, 100k start)")
+        print(f"\n== {axis} ==   (net $ on a $100k start)")
+        print(f"{'setup':<20}" + "".join(f"{v:>10}" for v in vals))
         for nm in names:
             cells = []
             for v in vals:
                 cfg = dict(BASE)
                 cfg[axis] = v
-                allt = []
-                for sym, _ in SYMS:
-                    tr, _ = run_options(st[sym], sigs[sym][nm], vols[sym],
-                                        cfg, 0, st[sym]["n"])
-                    allt += tr
+                allt, _ = run_all(st, vols, sigs, nm, cfg, win)
                 s = stats(allt, BASE["equity"])
-                cells.append(f"{s['net']:>9,.0f}" if s else f"{'-':>9}")
+                cells.append(f"{s['net']:>10,.0f}" if s else f"{'-':>10}")
             print(f"{nm:<20}{''.join(cells)}", flush=True)
 
 
-def risk_report(st, vols, sigs, names):
-    """An option position sized to lose $1,000 does not lose $1,000."""
-    print(f"\n== realised risk vs the $1,000 intended ==")
-    print(f"{'setup':<20}{'mean $':>9}{'sd $':>8}{'p90 $':>8}{'worst $':>9}"
-          f"{'>2x':>6}{'qty med':>9}")
-    for nm in names:
-        losses, qty = [], []
-        for sym, _ in SYMS:
-            tr, _ = run_options(st[sym], sigs[sym][nm], vols[sym], dict(BASE),
-                                0, st[sym]["n"])
-            losses += [-t["pnl"] for t in tr if t["pnl"] < 0]
-            qty += [t["qty"] for t in tr]
-        if not losses:
-            continue
-        losses.sort()
-        over = 100.0 * sum(1 for x in losses if x > 2000) / len(losses)
-        print(f"{nm:<20}{statistics.mean(losses):>9,.0f}"
-              f"{statistics.pstdev(losses):>8,.0f}"
-              f"{losses[int(len(losses) * 0.9)]:>8,.0f}{losses[-1]:>9,.0f}"
-              f"{over:>5.0f}%{statistics.median(qty):>9.0f}")
-
-
 if __name__ == "__main__":
-    _st, _vols, _sigs, _names = main()
-    if len(sys.argv) > 3 and sys.argv[3] == "sweep":
-        risk_report(_st, _vols, _sigs, _names)
-        sweep(_st, _vols, _sigs, _names)
+    _st, _vols, _sigs, _names, _win = main()
+    if "sweep" in sys.argv:
+        sweep(_st, _vols, _sigs, _names, _win)
