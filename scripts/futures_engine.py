@@ -21,12 +21,25 @@ from __future__ import annotations
 
 # multiplier: dollars per index point. tick: minimum price increment.
 # comm: round-turn commission + exchange/NFA fees, a realistic retail figure.
+# day_margin is the intraday requirement, which is what applies to a strategy
+# that is flat by the session end; overnight is several times larger. Both move
+# with volatility and differ by broker, so they are parameters, not constants --
+# check them against your own account before sizing anything real.
 CONTRACT = {
-    "ES":  dict(mult=50.0, tick=0.25, comm=4.94, name="E-mini S&P 500"),
-    "NQ":  dict(mult=20.0, tick=0.25, comm=4.94, name="E-mini Nasdaq 100"),
-    "MES": dict(mult=5.0,  tick=0.25, comm=1.44, name="Micro E-mini S&P"),
-    "MNQ": dict(mult=2.0,  tick=0.25, comm=1.44, name="Micro E-mini Nasdaq"),
+    "ES":  dict(mult=50.0, tick=0.25, comm=4.94, day_margin=500.0,
+                name="E-mini S&P 500"),
+    "NQ":  dict(mult=20.0, tick=0.25, comm=4.94, day_margin=500.0,
+                name="E-mini Nasdaq 100"),
+    "MES": dict(mult=5.0,  tick=0.25, comm=1.44, day_margin=50.0,
+                name="Micro E-mini S&P"),
+    "MNQ": dict(mult=2.0,  tick=0.25, comm=1.44, day_margin=50.0,
+                name="Micro E-mini Nasdaq"),
 }
+
+
+def max_by_margin(sym, equity, use_frac=1.0):
+    """Contracts the account could hold if margin were the only limit."""
+    return int(equity * use_frac // CONTRACT[sym]["day_margin"])
 
 
 def round_turn_cost(sym, contracts=1, spread_ticks=1.0):
