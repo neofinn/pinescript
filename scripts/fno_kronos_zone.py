@@ -147,7 +147,7 @@ def build_and_run(data, fcs, thresh, rr, use_gate, iv_mult, shuffle_dirs=None):
         rng = random.Random(shuffle_dirs)
         rng.shuffle(preds)
     eq = CAP0
-    tr = []
+    tr, dated = [], []
     busy_until = None
     for r, pred in zip(rows, preds):
         if abs(pred) < thresh:
@@ -173,11 +173,12 @@ def build_and_run(data, fcs, thresh, rr, use_gate, iv_mult, shuffle_dirs=None):
         if pnl is None:
             continue
         tr.append(pnl)
+        dated.append((day, pnl))
         eq = max(0.0, eq + pnl)
         busy_until = day
         if eq <= 0:
             break
-    return tr, eq
+    return tr, eq, dated
 
 
 def stats(tr, eq):
@@ -214,7 +215,7 @@ def main():
     for thresh, tl in ((0.0, "none"), (med, "median")):
         for rr in (1.5, 2.0, 3.0):
             for gate in (False, True):
-                tr, eq = build_and_run(data, fcs, thresh, rr, gate, 1.15)
+                tr, eq, _ = build_and_run(data, fcs, thresh, rr, gate, 1.15)
                 s = stats(tr, eq)
                 if s is None or s["n"] < 15:
                     print(f"{tl:<9}{rr:>5.1f}{str(gate):>6}{1.15:>6.2f}"
@@ -222,8 +223,8 @@ def main():
                     continue
                 sh = []
                 for k in range(30):
-                    t2, e2 = build_and_run(data, fcs, thresh, rr, gate, 1.15,
-                                           shuffle_dirs=7000 + k)
+                    t2, e2, _ = build_and_run(data, fcs, thresh, rr, gate,
+                                              1.15, shuffle_dirs=7000 + k)
                     if len(t2) >= 10:
                         sh.append(e2)
                 sh.sort()

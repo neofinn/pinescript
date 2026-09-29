@@ -77,7 +77,7 @@ def run(bars, plan, vix, spec, rr, lo, hi, sl=SL, hold=10_000):
     rt = spec["cost"].round_trip_frac()
     lot, spread = spec["lot"], spec["spread"]
     eq = CAP0
-    pos, tr = None, []
+    pos, tr, dated = None, [], []
     for i in range(lo, min(hi, len(bars) - 1)):
         bb = bars[i]
         if pos is not None:
@@ -105,6 +105,7 @@ def run(bars, plan, vix, spec, rr, lo, hi, sl=SL, hold=10_000):
                 pnl = max((px - pos["prem"]) * lot * pos["qty"] - cost_at(px),
                           -pos["limit"])
                 tr.append(pnl)
+                dated.append((dt.datetime.utcfromtimestamp(bb["t"]).date(), pnl))
                 eq = max(0.0, eq + pnl)
                 pos = None
         if pos is None and eq > 0 and plan[i] is not None:
@@ -139,7 +140,7 @@ def run(bars, plan, vix, spec, rr, lo, hi, sl=SL, hold=10_000):
             pos = dict(side=sd, stop=stop, targ=e + sd * rr * r, k=k, iv=iv,
                        call=call, prem=prem, qty=qty, expiry=expiry,
                        ses=ses_idx[i + 1], i=i + 1, limit=limit)
-    return tr, eq
+    return tr, eq, dated
 
 
 def stats(tr, eq):
@@ -211,7 +212,7 @@ def main():
             for rr in (1.5, 2.0, 3.0):
                 for gate in (False, True):
                     plan = build_plan(bars, fc, zn, thresh, rr, gate)
-                    tr, eq = run(bars, plan, vix, spec, rr, lo, hi)
+                    tr, eq, _ = run(bars, plan, vix, spec, rr, lo, hi)
                     s = stats(tr, eq)
                     if s is None or s["n"] < 15:
                         print(f"  {tlab:<10}{rr:>5.1f}{str(gate):>6}"
@@ -222,7 +223,7 @@ def main():
                     for k in range(40):
                         f2 = shuffled_forecasts(fc, 4000 + k)
                         p2 = build_plan(bars, f2, zn, thresh, rr, gate)
-                        t2, e2 = run(bars, p2, vix, spec, rr, lo, hi)
+                        t2, e2, _ = run(bars, p2, vix, spec, rr, lo, hi)
                         if len(t2) >= 10:
                             sh.append(e2)
                     sh.sort()
