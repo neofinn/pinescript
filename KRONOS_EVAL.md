@@ -123,3 +123,41 @@ predictions.**
 python3 scripts/kronos_forecast.py <bars.json> <out-dir> <tag> [model]
 python3 scripts/kronos_eval.py <forecast-dir>
 ```
+
+---
+
+## Appendix — higher timeframes (M15 and H1)
+
+The 5m result raised the obvious question: is one hour on five-minute bars just
+too short a horizon? So the same protocol was run on 15-minute and hourly bars,
+for ES and NIFTY, with two changes that matter.
+
+**Contamination.** ES hourly history reaches back to 2024-05-07 and the weights
+were frozen 2025-09-09, so forecast *targets* are restricted to post-cutoff.
+That dropped 56% of ES hourly candidates and 64% of NIFTY's. Context bars may
+predate the cutoff — seeing history as context is not leakage; having memorised
+what followed would be.
+
+**Non-overlapping.** Every stride is at least the 12-bar horizon, so forecasts
+do not share outcome bars and the intervals mean what they say.
+
+| series | n | horizon | hit% | majority | IC | IC 95% CI | range hit% |
+|---|---|---|---|---|---|---|---|
+| ES 15m | 165 | 3h | 49.1 | 55.2 | −0.045 | [−0.197, +0.110] | 3.6 |
+| NIFTY 15m | 78 | 3h | 46.2 | 57.7 | +0.043 | [−0.160, +0.244] | 6.4 |
+| ES 1h | 167 | 12h | 56.3 | 54.5 | +0.024 | [−0.136, +0.184] | 7.8 |
+| NIFTY 1h | 149 | 12h | 51.0 | 51.7 | +0.037 | [−0.153, +0.213] | 0.0 |
+| **POOLED** | **559** | | **51.3** | **51.3** | **+0.035** | **[−0.055, +0.131]** |
+
+Directional accuracy equals the majority baseline to the decimal. The shuffle
+control scores **+0.009** against the real **+0.035** — closer than at 5m, but
+the interval still covers zero.
+
+Higher timeframes do not rescue it. Across 5m, 15m and 1h — **1,015
+out-of-sample forecasts on two instruments** — no horizon from five minutes to
+twelve hours shows directional information distinguishable from shuffled.
+
+The detection floor is now tighter: pooling the higher timeframes gives a CI
+half-width of about 0.09, so an IC above ~0.13 would have been caught. An edge
+of 0.03–0.05 remains possible and would need several thousand more forecasts to
+separate.
