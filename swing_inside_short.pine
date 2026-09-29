@@ -1,0 +1,102 @@
+//@version=6
+// GOLD — 30M swing-high inside-bar short
+//   1. A candle makes a swing high (the "mother" candle)
+//   2. The next candle is small and sits inside it (inside bar)
+//   3. Sell when price breaks the inside bar's low
+//   Stop   above the mother candle's high, with a small buffer
+//   Target a fixed R multiple (1:2 default)
+//
+// RUN THIS ON A 30-MINUTE GOLD CHART (GC1! or XAUUSD).
+//
+// Measured with scripts/swing_inside_short.py, which runs these same rules
+// bar by bar. Defaults: 10-bar swing, inside bar <= 60% of mother, 3 bars to
+// trigger, 1:2, 1bp cost. Result in R, where 1R is the risk on each trade:
+//
+//   GC=F 30m, 58 days    22 trades  31.8% win  PF 0.89  -1.6R
+//   GC=F 1h,  2 years   163 trades  30.7% win  PF 0.85  -17.9R
+//   Shorting at a random mother candle, same stop/target: median -0.16R per
+//   trade. This rule gets -0.07R. It is a little better than random and still
+//   loses.
+//
+// What the test found:
+//   * A stricter swing high makes it WORSE. A 50-bar high: PF 0.18 on 30m and
+//     0.64 on 1h. A 100-bar high: 0 wins from 8 on 30m. Gold rose through the
+//     sample, and shorting fresh highs went against that trend.
+//   * A very small inside bar (<= 30% of the mother) was the only positive
+//     row: PF 1.9. But it is 2 trades on 30m and 20 on 1h. I found it by
+//     searching, so it has not been proven. Test it on data it has not seen
+//     before trusting it.
+//   * No reward:risk from 1:1 to 1:3 rescues it on the 2-year sample.
+//
+// Treat this as a chart tool for reviewing setups by eye, not a system to
+// trade live.
+
+strategy("GOLD 30M — swing-high inside-bar short",
+     overlay                 = true,
+     initial_capital         = 100000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.005,
+     process_orders_on_close = false,
+     max_labels_count        = 500,
+     max_lines_count         = 500)
+
+// ── inputs ────────────────────────────────────────────────────────────────
+lookback  = input.int(10,     "Swing high: highest of last N bars", minval = 2)
+maxRatio  = input.float(0.6,  "Inside bar max size (x mother range)", minval = 0.05, maxval = 1.0, step = 0.05)
+validBars = input.int(3,      "Bars allowed for the break",        minval = 1)
+rr        = input.float(2.0,  "Reward : risk",                     minval = 0.5, step = 0.5)
+bufPct    = input.float(0.03, "Stop buffer above mother high (%)", minval = 0.0, step = 0.01)
+showAll   = input.bool(true,  "Mark setups that never triggered")
+
+// ── setup: bar[1] is the mother, bar[0] is the inside bar ────────────────
+motherIsSwing = high[1] >= ta.highest(high, lookback)[1]
+motherRange   = high[1] - low[1]
+isInside      = high <= high[1] and low >= low[1]
+isSmall       = (high - low) <= maxRatio * motherRange
+setup         = motherIsSwing and motherRange > 0 and isInside and isSmall
+
+var float sEntry  = na
+var float sStop   = na
+var float sMother = na
+var int   sBar    = na
+
+flat = strategy.position_size == 0
+
+if setup and flat
+    sEntry  := low
+    sMother := high[1]
+    sStop   := high[1] * (1 + bufPct / 100)
+    sBar    := bar_index
+    strategy.cancel("Short")
+    strategy.entry("Short", strategy.short, stop = sEntry)
+    if showAll
+        label.new(bar_index, high, "IB", style = label.style_label_down,
+             color = color.new(color.orange, 20), textcolor = color.white, size = size.tiny)
+
+// cancel if the break did not come in time, or price broke the mother high first
+if not na(sBar) and flat and bar_index > sBar
+    expired     = bar_index - sBar >= validBars
+    invalidated = high > sMother and low > sEntry
+    if expired or invalidated
+        strategy.cancel("Short")
+        sBar := na
+
+// ── exits: stop above mother, target at rr x risk from the actual fill ───
+if strategy.position_size < 0
+    avgPx = strategy.position_avg_price
+    risk  = sStop - avgPx
+    tgt   = avgPx - rr * risk
+    strategy.exit("Exit", "Short", stop = sStop, limit = tgt)
+    sBar := na
+
+// ── drawing ─────────────────────────────────────────────────────────────
+inTrade = strategy.position_size < 0
+plot(inTrade ? sStop : na, "Stop", color.red, 2, plot.style_linebr)
+plot(inTrade ? strategy.position_avg_price : na, "Entry", color.gray, 1, plot.style_linebr)
+plot(inTrade ? strategy.position_avg_price - rr * (sStop - strategy.position_avg_price) : na,
+     "Target", color.green, 2, plot.style_linebr)
+plot(not na(sBar) and flat ? sEntry : na, "Pending sell stop", color.orange, 1, plot.style_linebr)
+
+alertcondition(setup, "Inside bar at swing high", "GOLD 30M: inside bar at swing high, sell stop at {{low}}")
