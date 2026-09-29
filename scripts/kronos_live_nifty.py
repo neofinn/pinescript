@@ -56,18 +56,17 @@ def future_stamps(last_t, n):
     return pd.to_datetime([last_t + BAR * (k + 1) for k in range(n)], unit="s")
 
 
-def run(pred, df, cols, pred_len, samples, chunk=10):
+def run(pred, df, cols, pred_len, samples, chunk=1):
     """Sampled paths, batched.
 
-    KronosPredictor batches `sample_count` inside one forward pass, so asking
-    for N paths in one call is several times cheaper than N calls asking for
-    one -- 30 separate calls made the first version of this script take about
-    four times as long as it needed to. It returns the MEAN of those paths,
-    though, and the mean is exactly what must not be reported here: averaging
-    sampled paths collapses the spread, and the spread is the forecast. So the
-    samples are drawn in small chunks and each chunk's mean kept as one path,
-    which preserves dispersion between chunks while still batching within
-    them.
+    KronosPredictor batches `sample_count` inside one forward pass, which is
+    cheaper per path -- but it returns their MEAN, not the paths. So batching
+    does not give a distribution: asking for 30 in one call yields one
+    averaged line, and asking for 30 in chunks of ten yields three. Since the
+    spread IS the forecast here, chunk defaults to 1 and each path costs its
+    own call. The batching is left reachable (chunk > 1) only for the case
+    where a smoothed central path is what is wanted, and it should not be
+    used to speed up a percentile.
     """
     x = df.loc[len(df) - LOOKBACK:, cols].reset_index(drop=True)
     xt = df.loc[len(df) - LOOKBACK:, "timestamps"].reset_index(drop=True)
