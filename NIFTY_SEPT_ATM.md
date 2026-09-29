@@ -79,9 +79,11 @@ search over one month of an intraday Indian options strategy will generate.
 
 What would make this answerable:
 
-1. **More months.** Twenty sessions cannot support a 160-cell search. The same
-   grid over two years, with the configuration chosen on the first half only,
-   would be a test rather than a description.
+1. ~~**More months.** Twenty sessions cannot support a 160-cell search.~~
+   **Tested in [NIFTY_1R_2026.md](NIFTY_1R_2026.md), and this was wrong.** Run
+   over 59 sessions and then 171, the strategy's maximum grew four-fold -- and
+   so did random's. The ranking stayed at the 3rd and 7th percentile. More
+   history gives a wide search more room; it does not rescue it.
 2. **A real options chain.** Every premium here is Black-Scholes off India VIX,
    not a traded bid and ask. Weekly ATM NIFTY options are liquid, so the model
    is not absurd, but a real chain would remove an assumption that currently
