@@ -1,0 +1,189 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  MA PULLBACK CONTINUATION   (clip B — @KUSHAGRATRADES26 / @nawabsoftrading)
+//
+//  WHAT THE CLIP ACTUALLY SHOWS, which is less than it appears:
+//    * GOLD, 1-minute chart (the timeframe strip reads 1m, selected)
+//    * ONE slow moving average, plotted blue, smooth enough over the visible
+//      window to be a long lookback rather than a scalping MA
+//    * a marked trade: a long taken where price came back down to the MA and
+//      turned, with a thin red band just under the entry (the stop) and a long
+//      run up to the top of the box (the target)
+//    * captions: "Strategy Revealed", "Strategy To Pass Funded Account Within
+//      A Day", and finally "Comment :- Strategy"
+//
+//  THE RULES ARE NEVER STATED. The clip is a lead magnet -- the numbers sit
+//  behind a comment-for-access gate. No MA type, no MA length, no entry
+//  trigger, no stop distance, no target. Everything below is a reconstruction
+//  of the ONE trade drawn on screen, and every assumption is an input:
+//
+//    entry   price pulls back to within `touchAtr` x ATR of the MA while the
+//            MA is rising, then closes back up. A pullback that closes below
+//            the MA is not a bounce, it is a break.
+//    stop    below the pullback's own low, which is what the red band under
+//            the entry depicts.
+//    target  an R multiple, since the box's height relative to the band is
+//            the only thing the clip communicates about size.
+//
+//  A 1-minute chart on a funded-account timeline is the part to be careful
+//  with: the clip's promise is a day, and a strategy that needs one good run
+//  to work is a strategy that needs one bad one to fail.
+//
+//  NOT COMPILED. No Pine compiler exists here. Checked for continuation
+//  indentation, local-scope var, plot in blocks, alertcondition in a strategy.
+// ═══════════════════════════════════════════════════════════════════════════
+
+strategy("MA Pullback Continuation", "MAPB", overlay = true,
+ initial_capital = 25000, default_qty_type = strategy.percent_of_equity,
+ default_qty_value = 10, pyramiding = 0, calc_on_every_tick = false,
+ process_orders_on_close = false,
+ commission_type = strategy.commission.percent, commission_value = 0.02,
+ slippage = 1, max_labels_count = 500, max_lines_count = 500)
+
+G1 = "1 · The moving average (type and length NOT shown)"
+maType = input.string("EMA", "MA type", options = ["EMA","SMA","WMA","HMA"],
+ group = G1)
+maLen  = input.int(200, "MA length", minval = 2, group = G1,
+ tooltip = "Never shown. 200 on a 1m chart matches how slowly the blue line " +
+ "moves across the clip's visible window.")
+reqRising = input.bool(true, "MA must be rising", group = G1)
+slopeBars = input.int(5, "  · rising measured over N bars", minval = 1,
+ group = G1)
+
+G2 = "2 · The pullback"
+touchAtr = input.float(0.25, "Pullback must come within (x ATR) of the MA",
+ minval = 0.0, step = 0.05, group = G2)
+reqCloseBack = input.bool(true, "and close back on the MA's side", group = G2,
+ tooltip = "A pullback that closes THROUGH the MA is a break, not a bounce.")
+atrLen = input.int(14, "ATR length", minval = 1, group = G2)
+cooldown = input.int(10, "Min bars between entries", minval = 0, group = G2)
+
+G3 = "3 · Risk"
+stopMode = input.string("Pullback low", "Stop",
+ options = ["Pullback low", "ATR"], group = G3)
+stopAtr = input.float(1.0, "  · x ATR (if ATR mode)", minval = 0.1, step = 0.1,
+ group = G3)
+stopBuf = input.float(0.1, "  · buffer beyond the low (x ATR)", minval = 0.0,
+ step = 0.05, group = G3)
+rr = input.float(3.0, "Target (R multiple)", minval = 0.1, step = 0.1,
+ group = G3)
+useTrail = input.bool(false, "Trail after 1R instead of a fixed target",
+ group = G3)
+
+G4 = "4 · Sides and session"
+allowLong  = input.bool(true, "Longs", group = G4)
+allowShort = input.bool(true, "Shorts (mirror of the same rule)", group = G4)
+useSess = input.bool(false, "Restrict to a session", group = G4)
+sessSpec = input.session("0000-2359", "Session", group = G4)
+
+// ── measurements ──────────────────────────────────────────────────────────
+hma(src, len) =>
+    ta.wma(2 * ta.wma(src, math.max(1, int(len / 2))) - ta.wma(src, len),
+     math.max(1, int(math.round(math.sqrt(len)))))
+
+ma = maType == "EMA" ? ta.ema(close, maLen) :
+ maType == "SMA" ? ta.sma(close, maLen) :
+ maType == "WMA" ? ta.wma(close, maLen) : hma(close, maLen)
+
+atr = ta.atr(atrLen)
+rising = ma > ma[slopeBars]
+falling = ma < ma[slopeBars]
+zone = nz(atr) * touchAtr
+inSess = not useSess or not na(time(timeframe.period, sessSpec))
+
+// The bar must TRADE INTO the band around the MA and CLOSE back out of it.
+// Entering on a touch alone is entering on price arriving, which is not the
+// same event as price being rejected there.
+touchedUp = low <= ma + zone and low >= ma - zone * 3.0
+longSetup = (not reqRising or rising) and touchedUp and
+ (not reqCloseBack or close > ma) and allowLong and inSess
+touchedDn = high >= ma - zone and high <= ma + zone * 3.0
+shortSetup = (not reqRising or falling) and touchedDn and
+ (not reqCloseBack or close < ma) and allowShort and inSess
+
+var int lastEntryBar = na
+cool = na(lastEntryBar) or bar_index - lastEntryBar >= cooldown
+flat = strategy.position_size == 0
+
+goLong = longSetup and flat and cool
+goShort = shortSetup and flat and cool
+
+// ── orders ────────────────────────────────────────────────────────────────
+var float stopPx = na
+var float targPx = na
+var float pendStop = na
+
+if goLong and barstate.isconfirmed
+    pendStop := stopMode == "ATR" ? close - nz(atr) * stopAtr
+     : low - nz(atr) * stopBuf
+    strategy.entry("L", strategy.long, comment = "MA bounce")
+    lastEntryBar := bar_index
+if goShort and barstate.isconfirmed
+    pendStop := stopMode == "ATR" ? close + nz(atr) * stopAtr
+     : high + nz(atr) * stopBuf
+    strategy.entry("S", strategy.short, comment = "MA bounce")
+    lastEntryBar := bar_index
+
+justL = strategy.position_size > 0 and nz(strategy.position_size[1]) <= 0
+justS = strategy.position_size < 0 and nz(strategy.position_size[1]) >= 0
+
+// A limit or gapped fill can land past the structural stop, which would leave
+// the stop on the wrong side of the entry and book an instant loss that reads
+// as the strategy failing rather than as an unhandled fill.
+if justL
+    e = strategy.position_avg_price
+    stopPx := math.min(nz(pendStop, e - nz(atr)), e - syminfo.mintick)
+    targPx := e + (e - stopPx) * rr
+if justS
+    e = strategy.position_avg_price
+    stopPx := math.max(nz(pendStop, e + nz(atr)), e + syminfo.mintick)
+    targPx := e - (stopPx - e) * rr
+
+if strategy.position_size > 0 and not na(stopPx)
+    e = strategy.position_avg_price
+    r1 = e + (e - stopPx)
+    if useTrail and high >= r1
+        stopPx := math.max(stopPx, high - nz(atr) * 1.5)
+    strategy.exit("Lx", "L", stop = stopPx, limit = useTrail ? na : targPx)
+if strategy.position_size < 0 and not na(stopPx)
+    e = strategy.position_avg_price
+    r1 = e - (stopPx - e)
+    if useTrail and low <= r1
+        stopPx := math.min(stopPx, low + nz(atr) * 1.5)
+    strategy.exit("Sx", "S", stop = stopPx, limit = useTrail ? na : targPx)
+
+if strategy.position_size == 0
+    stopPx := na
+    targPx := na
+
+// ── drawing ───────────────────────────────────────────────────────────────
+pm = plot(ma, "MA", rising ? color.new(color.blue, 0) : color.new(color.navy, 40),
+ linewidth = 2)
+plot(ma + zone, "band +", color.new(color.blue, 80))
+plot(ma - zone, "band -", color.new(color.blue, 80))
+plotshape(goLong, "Long", shape.triangleup, location.belowbar,
+ color.new(color.green, 0), size = size.tiny)
+plotshape(goShort, "Short", shape.triangledown, location.abovebar,
+ color.new(color.red, 0), size = size.tiny)
+plot(strategy.position_size != 0 ? stopPx : na, "Stop",
+ color.new(color.red, 0), style = plot.style_linebr)
+plot(strategy.position_size != 0 and not useTrail ? targPx : na, "Target",
+ color.new(color.green, 0), style = plot.style_linebr)
+
+var table t = table.new(position.top_right, 2, 4, border_width = 1)
+if barstate.islast
+    table.cell(t, 0, 0, "MA (assumed)", text_size = size.small)
+    table.cell(t, 1, 0, maType + " " + str.tostring(maLen),
+     text_size = size.small, text_color = color.orange)
+    table.cell(t, 0, 1, "pullback zone", text_size = size.small)
+    table.cell(t, 1, 1, str.tostring(touchAtr) + " xATR", text_size = size.small)
+    table.cell(t, 0, 2, "stop", text_size = size.small)
+    table.cell(t, 1, 2, stopMode, text_size = size.small)
+    table.cell(t, 0, 3, "target", text_size = size.small)
+    table.cell(t, 1, 3, useTrail ? "trail" : str.tostring(rr) + " R",
+     text_size = size.small)
+
+if goLong and barstate.isconfirmed
+    alert("MA PULLBACK LONG " + syminfo.ticker, alert.freq_once_per_bar_close)
+if goShort and barstate.isconfirmed
+    alert("MA PULLBACK SHORT " + syminfo.ticker, alert.freq_once_per_bar_close)

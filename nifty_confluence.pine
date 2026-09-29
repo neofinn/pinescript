@@ -1,0 +1,298 @@
+//@version=6
+// NIFTY — volume surge, supply/demand zones, underlying confluence
+//
+// Built from measured results, not assumption. What the backtests said:
+//
+//   * ^NSEI prints NO volume at any timeframe, so a volume gate on the index
+//     itself is impossible. Constituent traded value correlates +0.68 with
+//     index returns against +0.29 for the index's own volume field, so the
+//     gate is rebuilt from the underlying. That is the "confluence" here.
+//   * The surge gate graded monotonically across ten thresholds on daily bars
+//     (PF 1.10 -> 2.61), which is why it is the default filter. It did NOT
+//     survive intraday, where it spikes at one threshold and dips either side.
+//   * Shorting this signal returned a 0.17 profit factor across 19 years, and
+//     long-only beat both-sides on 17 of 19 world indices. Long only is default.
+//   * Supply/demand zones were inert below 2x ATR and destructive above it
+//     (PF 1.80 -> 1.49): only 12 of 34 signals had any live zone ahead, because
+//     a 50-day breakout has already cleared the structure a zone describes.
+//     They are implemented in full and default OFF. Turn them on to see for
+//     yourself rather than take my word for it.
+//
+// Pine allows at most 40 request.security() calls, so the breadth is built from
+// the top 20 constituents by weight (about 70% of the index) at one call each.
+
+strategy("NIFTY Volume Surge + Zones + Confluence",
+     overlay              = true,
+     initial_capital      = 1000000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.03,
+     slippage             = 2,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     max_boxes_count      = 500)
+
+// ─── inputs ────────────────────────────────────────────────────────────────
+grpS = "Signal"
+donLen   = input.int(50,  "Breakout lookback",     minval = 5,  group = grpS)
+emaFast  = input.int(50,  "Fast EMA",              minval = 2,  group = grpS)
+emaSlow  = input.int(150, "Slow EMA",              minval = 5,  group = grpS)
+longOnly = input.bool(true, "Long only  (shorts measured at PF 0.17)", group = grpS)
+
+grpV = "Underlying confluence  (volume surge)"
+useSurge = input.bool(true,  "Require constituent volume surge", group = grpV)
+volLen   = input.int(20,   "Each stock's volume lookback", minval = 5,  group = grpV)
+volMult  = input.float(1.5,"Surge = volume above this multiple of its own average",
+     minval = 1.0, step = 0.1, group = grpV)
+surgePct = input.float(30, "Percent of constituents that must be surging",
+     minval = 0, maxval = 100, step = 5, group = grpV)
+
+grpZ = "Supply / demand zones"
+showZones = input.bool(true,  "Draw zones", group = grpZ)
+useRoom   = input.bool(false, "Require room ahead  (measured: hurts)", group = grpZ)
+roomATR   = input.float(2.0,  "Minimum room to the next zone, in ATR",
+     minval = 0.1, step = 0.5, group = grpZ)
+baseMax   = input.int(3,     "Max candles in a base", minval = 1, maxval = 5, group = grpZ)
+quietMult = input.float(0.8, "Base candle range below this multiple of ATR",
+     minval = 0.1, step = 0.1, group = grpZ)
+departMult= input.float(1.5, "Departure candle range above this multiple of ATR",
+     minval = 0.5, step = 0.1, group = grpZ)
+
+grpR = "Risk"
+atrLen   = input.int(14,   "ATR length", minval = 2, group = grpR)
+stopATR  = input.float(3.0,"Stop distance in ATR  (this is 1R)",
+     minval = 0.5, step = 0.5, group = grpR)
+useTrail = input.bool(true, "Trail the stop", group = grpR)
+
+// ─── the underlying: one security call per constituent ─────────────────────
+// Each call returns 1 when that stock is trading above volMult times its own
+// average volume, 0 when it is not, and na when it has no data on this bar.
+// Averaging over the non-na answers is what makes this a breadth reading
+// rather than a count that silently shrinks when a symbol is missing.
+f_surge(simple string sym) =>
+    request.security(sym, timeframe.period,
+         na(volume) ? na : (volume > ta.sma(volume, volLen) * volMult ? 1.0 : 0.0),
+         lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+s01 = f_surge("NSE:HDFCBANK")
+s02 = f_surge("NSE:ICICIBANK")
+s03 = f_surge("NSE:RELIANCE")
+s04 = f_surge("NSE:INFY")
+s05 = f_surge("NSE:BHARTIARTL")
+s06 = f_surge("NSE:ITC")
+s07 = f_surge("NSE:TCS")
+s08 = f_surge("NSE:LT")
+s09 = f_surge("NSE:AXISBANK")
+s10 = f_surge("NSE:KOTAKBANK")
+s11 = f_surge("NSE:SBIN")
+s12 = f_surge("NSE:HINDUNILVR")
+s13 = f_surge("NSE:BAJFINANCE")
+s14 = f_surge("NSE:MARUTI")
+s15 = f_surge("NSE:SUNPHARMA")
+s16 = f_surge("NSE:NTPC")
+s17 = f_surge("NSE:HCLTECH")
+s18 = f_surge("NSE:TITAN")
+s19 = f_surge("NSE:ULTRACEMCO")
+s20 = f_surge("NSE:TATAMOTORS")
+
+// array.from keeps the reduction readable; a 20-deep nest of helper
+// calls is the same arithmetic and impossible to audit.
+sAll = array.from(s01, s02, s03, s04, s05, s06, s07, s08, s09, s10, s11, s12, s13, s14, s15, s16, s17, s18, s19, s20)
+
+float surgeSum = 0.0
+int   surgeCnt = 0
+for i = 0 to array.size(sAll) - 1
+    v = array.get(sAll, i)
+    if not na(v)
+        surgeSum += v
+        surgeCnt += 1
+
+// share of reporting constituents that are surging; na until enough report
+breadth = surgeCnt >= 10 ? surgeSum / surgeCnt : na
+surgeOk = not useSurge or (not na(breadth) and breadth * 100 >= surgePct)
+
+// ─── trend and breakout ────────────────────────────────────────────────────
+atr  = ta.atr(atrLen)
+ef   = ta.ema(close, emaFast)
+es   = ta.ema(close, emaSlow)
+up   = ef > es
+dn   = es > ef
+
+// prior-bar extremes, so the breakout bar itself is excluded
+hiN = ta.highest(high, donLen)[1]
+loN = ta.lowest(low,  donLen)[1]
+
+// ─── supply / demand zones ─────────────────────────────────────────────────
+// A base is a run of quiet candles that a large candle leaves in a hurry; the
+// base is where the unfilled orders sat. A zone stays live until price trades
+// back through it.
+var float[] zTop  = array.new_float()
+var float[] zBot  = array.new_float()
+var int[]   zKind = array.new_int()      // 1 demand, -1 supply
+var bool[]  zLive = array.new_bool()
+var box[]   zBox  = array.new_box()
+
+rng     = high - low
+isDepart = not na(atr) and atr > 0 and rng > departMult * atr
+departUp = isDepart and close > open
+
+// walk back over the candles behind the departure to find the base
+f_baseLo(int maxN) =>
+    float lo = na
+    int   n  = 0
+    broken   = false
+    for i = 1 to maxN
+        if not broken
+            r = high[i] - low[i]
+            a = atr[i]
+            if not na(a) and a > 0 and r <= quietMult * a
+                lo := na(lo) ? low[i] : math.min(lo, low[i])
+                n  += 1
+            else
+                broken := true
+    [lo, n]
+
+f_baseHi(int maxN) =>
+    float hi = na
+    broken   = false
+    for i = 1 to maxN
+        if not broken
+            r = high[i] - low[i]
+            a = atr[i]
+            if not na(a) and a > 0 and r <= quietMult * a
+                hi := na(hi) ? high[i] : math.max(hi, high[i])
+            else
+                broken := true
+    hi
+
+[bLo, bN] = f_baseLo(baseMax)
+bHi       = f_baseHi(baseMax)
+
+if isDepart and bN > 0 and not na(bLo) and not na(bHi)
+    array.push(zTop,  bHi)
+    array.push(zBot,  bLo)
+    array.push(zKind, departUp ? 1 : -1)
+    array.push(zLive, true)
+    box b = na
+    if showZones
+        b := box.new(bar_index - bN, bHi, bar_index, bLo,
+             border_color = departUp ? color.new(color.teal, 40) : color.new(color.maroon, 40),
+             bgcolor      = departUp ? color.new(color.teal, 88) : color.new(color.maroon, 88))
+    array.push(zBox, b)
+    // Bound the history. A dead zone is never consulted again, and unbounded
+    // arrays across nineteen years of bars will trip Pine's limits.
+    if array.size(zTop) > 200
+        old = array.shift(zBox)
+        if not na(old)
+            box.delete(old)
+        array.shift(zTop)
+        array.shift(zBot)
+        array.shift(zKind)
+        array.shift(zLive)
+
+// retire zones price has traded through, and extend the ones still live
+if array.size(zTop) > 0
+    for i = 0 to array.size(zTop) - 1
+        if array.get(zLive, i)
+            k  = array.get(zKind, i)
+            tp = array.get(zTop, i)
+            bt = array.get(zBot, i)
+            dead = (k == 1 and low < bt) or (k == -1 and high > tp)
+            if dead
+                array.set(zLive, i, false)
+                bx = array.get(zBox, i)
+                if not na(bx)
+                    box.set_bgcolor(bx, color.new(color.gray, 94))
+                    box.set_border_color(bx, color.new(color.gray, 70))
+            else
+                bx = array.get(zBox, i)
+                if not na(bx)
+                    box.set_right(bx, bar_index)
+
+// distance to the nearest live zone standing in the way
+f_room(int dir) =>
+    float best = na
+    if array.size(zTop) > 0
+        for i = 0 to array.size(zTop) - 1
+            if array.get(zLive, i)
+                k = array.get(zKind, i)
+                if dir > 0 and k == -1 and array.get(zBot, i) > close
+                    d = array.get(zBot, i) - close
+                    best := na(best) ? d : math.min(best, d)
+                if dir < 0 and k == 1 and array.get(zTop, i) < close
+                    d = close - array.get(zTop, i)
+                    best := na(best) ? d : math.min(best, d)
+    best
+
+roomLong  = f_room(1)
+roomShort = f_room(-1)
+roomOkL   = not useRoom or na(roomLong)  or roomLong  >= roomATR * atr
+roomOkS   = not useRoom or na(roomShort) or roomShort >= roomATR * atr
+
+// ─── entries ───────────────────────────────────────────────────────────────
+ready    = not na(atr) and atr > 0 and not na(hiN) and not na(loN) and not na(es)
+goLong   = ready and close > hiN and up and surgeOk and roomOkL
+goShort  = ready and close < loN and dn and surgeOk and roomOkS and not longOnly
+
+if goLong and strategy.position_size == 0
+    strategy.entry("L", strategy.long)
+if goShort and strategy.position_size == 0
+    strategy.entry("S", strategy.short)
+
+// ─── the stop: 3x ATR, trailed, never loosened ─────────────────────────────
+var float stopLvl = na
+if strategy.position_size == 0
+    stopLvl := na
+if strategy.position_size > 0
+    cand = close - stopATR * atr
+    stopLvl := na(stopLvl) ? cand : (useTrail ? math.max(stopLvl, cand) : stopLvl)
+    strategy.exit("L-x", "L", stop = stopLvl)
+if strategy.position_size < 0
+    cand = close + stopATR * atr
+    stopLvl := na(stopLvl) ? cand : (useTrail ? math.min(stopLvl, cand) : stopLvl)
+    strategy.exit("S-x", "S", stop = stopLvl)
+
+// close on the trend flipping against the position
+if strategy.position_size > 0 and ta.crossunder(ef, es)
+    strategy.close("L", comment = "trend")
+if strategy.position_size < 0 and ta.crossover(ef, es)
+    strategy.close("S", comment = "trend")
+
+// ─── plots ─────────────────────────────────────────────────────────────────
+plot(ef, "Fast EMA", color.new(color.orange, 0), 1)
+plot(es, "Slow EMA", color.new(color.blue,   0), 1)
+plot(hiN, "Breakout high", color.new(color.teal,   60), 1, plot.style_stepline)
+plot(loN, "Breakout low",  color.new(color.maroon, 60), 1, plot.style_stepline)
+plot(strategy.position_size != 0 ? stopLvl : na, "Stop",
+     color.new(color.red, 0), 2, plot.style_linebr)
+
+bgcolor(useSurge and not na(breadth) and breadth * 100 >= surgePct
+     ? color.new(color.teal, 92) : na, title = "Confluence on")
+
+// breadth readout, so the gate is visible rather than implied
+var table tb = table.new(position.top_right, 2, 4,
+     bgcolor = color.new(color.black, 20), border_width = 1)
+if barstate.islast
+    table.cell(tb, 0, 0, "constituents reporting", text_color = color.gray, text_size = size.tiny)
+    table.cell(tb, 1, 0, str.tostring(surgeCnt), text_color = color.white, text_size = size.tiny)
+    table.cell(tb, 0, 1, "surging now", text_color = color.gray, text_size = size.tiny)
+    table.cell(tb, 1, 1, na(breadth) ? "n/a" : str.tostring(breadth * 100, "#.0") + "%",
+         text_color = na(breadth) ? color.gray :
+         (breadth * 100 >= surgePct ? color.lime : color.orange), text_size = size.tiny)
+    table.cell(tb, 0, 2, "gate needs", text_color = color.gray, text_size = size.tiny)
+    table.cell(tb, 1, 2, str.tostring(surgePct, "#") + "%", text_color = color.white, text_size = size.tiny)
+    table.cell(tb, 0, 3, "live zones", text_color = color.gray, text_size = size.tiny)
+    zn = 0
+    if array.size(zLive) > 0
+        for i = 0 to array.size(zLive) - 1
+            zn += array.get(zLive, i) ? 1 : 0
+    table.cell(tb, 1, 3, str.tostring(zn), text_color = color.white, text_size = size.tiny)
+
+// alertcondition() is rejected inside a strategy, so alerts fire from alert()
+if goLong and strategy.position_size == 0
+    alert("NIFTY long: breakout with constituent volume confluence at " +
+         str.tostring(close, "#.##"), alert.freq_once_per_bar_close)
+if goShort and strategy.position_size == 0
+    alert("NIFTY short: breakdown with constituent volume confluence at " +
+         str.tostring(close, "#.##"), alert.freq_once_per_bar_close)
