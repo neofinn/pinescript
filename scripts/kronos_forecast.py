@@ -45,6 +45,13 @@ def load(path):
 def main():
     src, out_dir, tag = sys.argv[1], sys.argv[2], sys.argv[3]
     which = sys.argv[4] if len(sys.argv) > 4 else "NeoQuasar/Kronos-small"
+    # Forecast TARGETS must post-date the weights, or the model is being asked
+    # about bars it may have trained on. Kronos-small was published
+    # 2025-06-30 and last modified 2025-09-09; the later date is the safe one.
+    # Context bars before the cutoff are allowed -- seeing history as context
+    # is not leakage, having memorised what followed it would be.
+    after = sys.argv[5] if len(sys.argv) > 5 else "2025-09-09"
+    stride = int(sys.argv[6]) if len(sys.argv) > 6 else STRIDE
     torch.set_num_threads(4)
     tok = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
     mdl = Kronos.from_pretrained(which)
@@ -52,17 +59,29 @@ def main():
 
     df = load(src)
     n = len(df)
+    # An index that prints no volume must have the channel OMITTED, not fed as
+    # a column of zeros: a constant zero is a value the model will condition
+    # on, and it is not one any real instrument produces.
+    cols = ["open", "high", "low", "close", "volume"]
+    if (df["volume"] > 0).mean() < 0.5:
+        cols = ["open", "high", "low", "close"]
+        print(f"{tag}: volume absent on "
+              f"{(df['volume'] <= 0).mean() * 100:.0f}% of bars -> OHLC only",
+              flush=True)
     out_path = os.path.join(out_dir, f"{tag}.json")
     rows = json.load(open(out_path)) if os.path.exists(out_path) else []
     done = {r["i"] for r in rows}
-    points = [i for i in range(LOOKBACK, n - PRED_LEN, STRIDE) if i not in done]
-    print(f"{tag}: {len(points)} forecasts to make ({len(done)} cached)",
-          flush=True)
+    cut = pd.Timestamp(after)
+    cand = list(range(LOOKBACK, n - PRED_LEN, stride))
+    pre = sum(1 for i in cand if df.loc[i, "timestamps"] < cut)
+    points = [i for i in cand
+              if i not in done and df.loc[i, "timestamps"] >= cut]
+    print(f"{tag}: {len(points)} forecasts to make ({len(done)} cached); "
+          f"{pre} candidates dropped as pre-{after}", flush=True)
 
     t0 = time.time()
     for k, i in enumerate(points):
-        x = df.loc[i - LOOKBACK:i - 1,
-                   ["open", "high", "low", "close", "volume"]].reset_index(drop=True)
+        x = df.loc[i - LOOKBACK:i - 1, cols].reset_index(drop=True)
         xt = df.loc[i - LOOKBACK:i - 1, "timestamps"].reset_index(drop=True)
         yt = df.loc[i:i + PRED_LEN - 1, "timestamps"].reset_index(drop=True)
         try:
