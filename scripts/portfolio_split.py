@@ -35,7 +35,8 @@ def curve(dated, start):
     eq = peak = start
     dd = 0.0
     out = []
-    for day, pnl in dated:
+    for rec in dated:
+        day, pnl = rec[0], rec[1]
         eq = max(0.0, eq + pnl)
         peak = max(peak, eq)
         dd = max(dd, (peak - eq) / peak)
@@ -46,7 +47,8 @@ def curve(dated, start):
 def monthly(dated, start):
     """Return per calendar month, as a fraction of the sleeve at month start."""
     by = {}
-    for day, pnl in dated:
+    for rec in dated:
+        day, pnl = rec[0], rec[1]
         by.setdefault((day.year, day.month), []).append(pnl)
     eq = start
     out = {}

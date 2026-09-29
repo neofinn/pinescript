@@ -105,7 +105,13 @@ def run(bars, plan, vix, spec, rr, lo, hi, sl=SL, hold=10_000):
                 pnl = max((px - pos["prem"]) * lot * pos["qty"] - cost_at(px),
                           -pos["limit"])
                 tr.append(pnl)
-                dated.append((dt.datetime.utcfromtimestamp(bb["t"]).date(), pnl))
+                # equity at ENTRY is recorded so the trade can be replayed at a
+                # different capital level: pnl scales with the position, which
+                # scales with the equity the trade was sized against. Integer
+                # lot rounding makes that proportionality approximate, and the
+                # replay is validated against the true run before it is used.
+                dated.append((dt.datetime.utcfromtimestamp(bb["t"]).date(),
+                              pnl, pos["eq_at_entry"]))
                 eq = max(0.0, eq + pnl)
                 pos = None
         if pos is None and eq > 0 and plan[i] is not None:
@@ -139,7 +145,8 @@ def run(bars, plan, vix, spec, rr, lo, hi, sl=SL, hold=10_000):
                 continue
             pos = dict(side=sd, stop=stop, targ=e + sd * rr * r, k=k, iv=iv,
                        call=call, prem=prem, qty=qty, expiry=expiry,
-                       ses=ses_idx[i + 1], i=i + 1, limit=limit)
+                       ses=ses_idx[i + 1], i=i + 1, limit=limit,
+                       eq_at_entry=eq)
     return tr, eq, dated
 
 
