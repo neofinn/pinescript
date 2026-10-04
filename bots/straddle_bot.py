@@ -77,6 +77,8 @@ class Config:
     trail_len: int = 10
     atr_len: int = 14
     atr_mult: float = 3.0
+    entry_pad: float = 0.0       # ATR beyond the channel for the initial stops
+    trail_delay: float = 0.0     # ATR of profit before the trail starts
     sar: bool = False            # flat-and-rearm measured better than always-in
     risk_frac: float = 0.005     # of equity, per trade
     equity: float = 100_000.0
@@ -108,9 +110,19 @@ def atr(bars, n):
 
 
 def levels(bars, cfg: Config):
-    """Entry straddle from CLOSED bars. bars[-1] must already be complete."""
+    """Entry straddle from CLOSED bars. bars[-1] must already be complete.
+
+    entry_pad widens the straddle by that many ATR on each side. Measured on
+    gold (GOLD_STRADDLE_001LOT.md): 1 ATR of padding is the only hourly
+    configuration positive in both halves of the sample, and is unnecessary on
+    daily. Beyond ~1 ATR the channel stops being touched at all."""
     w = bars[-cfg.entry_len:]
-    return max(b["h"] for b in w), min(b["l"] for b in w)
+    hi, lo = max(b["h"] for b in w), min(b["l"] for b in w)
+    if cfg.entry_pad:
+        a = atr(bars, cfg.atr_len)
+        if a:
+            hi, lo = hi + cfg.entry_pad * a, lo - cfg.entry_pad * a
+    return hi, lo
 
 
 def trail_stop(bars, cfg: Config, pos: float, ext: float) -> Optional[float]:
@@ -257,6 +269,10 @@ def main(argv=None):
     p.add_argument("--entry-len", type=int, default=20)
     p.add_argument("--trail", choices=["atr", "donchian"], default="atr")
     p.add_argument("--atr-mult", type=float, default=3.0)
+    p.add_argument("--entry-pad", type=float, default=0.0,
+                   help="widen the initial straddle by this many ATR each side")
+    p.add_argument("--trail-delay", type=float, default=0.0,
+                   help="ATR of profit required before the trail starts moving")
     p.add_argument("--sar", action="store_true",
                    help="always-in reversal; measured WORSE than flat-and-rearm")
     p.add_argument("--risk", type=float, default=0.005)
@@ -270,6 +286,7 @@ def main(argv=None):
                         format="%(asctime)s %(levelname)-7s %(message)s")
     cfg = Config(symbol=a.symbol, timeframe=a.timeframe, entry_len=a.entry_len,
                  trail=a.trail, atr_mult=a.atr_mult, sar=a.sar,
+                 entry_pad=a.entry_pad, trail_delay=a.trail_delay,
                  risk_frac=a.risk, equity=a.equity)
     try:
         from broker_adapters import make_broker        # user supplies this

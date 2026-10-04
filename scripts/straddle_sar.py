@@ -50,8 +50,25 @@ def atr(bars, n=14):
 
 
 def run(bars, entry_len=20, trail_len=10, trail="donchian", atr_mult=3.0,
-        atr_len=14, cost_bps=1.0, sar=True, start_i=None):
-    """Returns (trades, info). Each trade is one completed position."""
+        atr_len=14, cost_bps=1.0, sar=True, start_i=None,
+        entry_pad=0.0, trail_delay=0.0, cost_abs=0.0, swap_per_bar=0.0):
+    """Returns (trades, info). Each trade is one completed position.
+
+    entry_pad     widens the INITIAL straddle: the buy-stop sits this many ATR
+                  ABOVE the channel high and the sell-stop the same distance
+                  below the channel low. 0 reproduces the plain channel break.
+                  A wider straddle takes fewer, more committed breaks and pays
+                  a worse entry price for each -- which of those dominates is
+                  the experiment, not an assumption.
+    trail_delay   the trail does not start until price has moved this many ATR
+                  in favour. Until then the stop stays where it was first set.
+                  This is the "give it room before managing it" knob.
+    cost_abs      cost per leg in PRICE units, for instruments quoted with a
+                  fixed spread (a retail XAUUSD spread is cents per ounce, not
+                  basis points). Added to cost_bps rather than replacing it.
+    swap_per_bar  financing charged per bar held, in price units. Negative is
+                  a cost. Matters on a CFD held for days.
+    """
     n = len(bars)
     a = atr(bars, atr_len)
     hi = [b["h"] for b in bars]
@@ -67,11 +84,13 @@ def run(bars, entry_len=20, trail_len=10, trail="donchian", atr_mult=3.0,
 
     def book(exit_px, i, reason):
         gross = (exit_px - entry) * pos
-        fees = (entry + exit_px) * cost
+        fees = (entry + exit_px) * cost + 2.0 * cost_abs
+        carry = swap_per_bar * max(0, i - i_in)
+        net = gross - fees + carry
         trades.append(dict(side=pos, entry=entry, exit=exit_px,
-                           pnl=gross - fees, ret=(gross - fees) / entry,
+                           pnl=net, ret=net / entry, gross=gross, fees=fees,
                            i_in=i_in, i_out=i, reason=reason,
-                           t=bars[i_in]["t"]))
+                           bars_held=max(1, i - i_in), t=bars[i_in]["t"]))
 
     i_in = i0
     for i in range(i0, n):
@@ -80,6 +99,9 @@ def run(bars, entry_len=20, trail_len=10, trail="donchian", atr_mult=3.0,
         dn = min(lo[i - entry_len:i])
 
         if pos == 0:
+            if entry_pad and a[i] is not None:
+                up = up + entry_pad * a[i]
+                dn = dn - entry_pad * a[i]
             hit_u = b["h"] >= up
             hit_d = b["l"] <= dn
             if hit_u and hit_d:
@@ -117,8 +139,12 @@ def run(bars, entry_len=20, trail_len=10, trail="donchian", atr_mult=3.0,
             else:
                 pos = 0
         else:
-            s2 = _stop(bars, i, pos, ext, lo, hi, trail, trail_len, a, atr_mult)
-            stop = max(stop, s2) if pos > 0 else min(stop, s2)   # never loosens
+            moved = (ext - entry) * pos
+            room = trail_delay * (a[i] or 0.0)
+            if moved >= room:          # only manage once it has earned the room
+                s2 = _stop(bars, i, pos, ext, lo, hi, trail, trail_len,
+                           a, atr_mult)
+                stop = max(stop, s2) if pos > 0 else min(stop, s2)  # never loosens
 
     if pos != 0:
         book(bars[-1]["c"], n - 1, "eod")

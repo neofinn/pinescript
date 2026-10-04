@@ -27,6 +27,13 @@
 //     96% on BTC and ETH. The gross edge is 0.135 bp per trade against a 2-20
 //     bp round trip.
 //
+//   * on GOLD at fixed 0.01 lot (GOLD_STRADDLE_001LOT.md) it IS profitable net
+//     of retail spread, commission and swap -- fees are 2-8% of gross, not the
+//     binding constraint. Daily, plain channel, ATR-2 trail replicated across
+//     two independent decades at 3.38 and 3.30 dollars per dollar of
+//     drawdown, against holding's 0.88 and 1.75. It makes two thirds of
+//     holding's money with a third of its drawdown.
+//
 // So: run it on daily bars or slower, as a portfolio, never on an hourly or
 // minute chart, and know that the edge measured here lived in the two most
 // strongly trending markets in the sample.
@@ -38,6 +45,9 @@ strategy("Straddle SAR — two-sided stops", overlay=true, calc_on_every_tick=fa
 
 grpE = "Entry straddle"
 entryLen = input.int(20, "Entry channel (bars)", minval=2, group=grpE)
+entryPad = input.float(0.0, "Widen the straddle by (ATR each side)", minval=0.0,
+   maxval=3.0, step=0.5, group=grpE,
+   tooltip="Measured on gold at 0.01 lot (GOLD_STRADDLE_001LOT.md): 1 ATR of padding is the only HOURLY setting positive in both halves of the sample, and is unnecessary on DAILY, where the plain channel with an ATR-2 trail replicated at 3.38 and 3.30 dollars per dollar of drawdown across two decades. Beyond ~1 ATR the channel stops being touched and the sample dies.")
 grpX = "Trailing stop"
 trailMode = input.string("ATR", "Trail by", options=["ATR", "Donchian"], group=grpX)
 atrLen   = input.int(14, "ATR length", minval=2, group=grpX)
@@ -48,9 +58,9 @@ useSar   = input.bool(false, "Stop-and-reverse (always in market)", group=grpM,
    tooltip="OFF = go flat and re-arm the straddle. Measurably better: the flat variant can sit out a range, the SAR variant cannot.")
 
 // levels from CLOSED bars only -- these are the resting order prices
-up = ta.highest(high, entryLen)[1]
-dn = ta.lowest(low,  entryLen)[1]
 a  = ta.atr(atrLen)
+up = ta.highest(high, entryLen)[1] + entryPad * a
+dn = ta.lowest(low,  entryLen)[1]  - entryPad * a
 
 var float ext  = na
 var float stop = na
