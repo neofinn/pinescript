@@ -38,6 +38,13 @@ system loses to its own transaction costs, and the daily portfolio edge that
 did show up came entirely from BTC and ETH. Run it on daily bars across many
 markets, on a demo account, for long enough to see a drawdown, before it ever
 touches real money.
+
+Do NOT run it on minute bars. Measured over 15 markets (STRADDLE_FAST_BARS.md):
+at 1-minute a round trip costs 192% of the bar's own average range, the system
+beat buy-and-hold in 0 of 15 markets, and the account lost 20% in 25 days --
+96% on BTC and ETH. The gross edge there is 0.135 basis points per trade
+against a 2-20 bp round trip, so no execution improvement reaches it. The
+--timeframe default is 1d deliberately.
 """
 from __future__ import annotations
 import argparse, json, logging, os, sys, time
