@@ -1,0 +1,88 @@
+//@version=5
+// Two-sided stop orders, stop-and-reverse.
+//
+//   FLAT     a buy-stop sits at the N-bar high, a sell-stop at the N-bar low.
+//   FILLED   whichever side fills is the position. The opposite order is NOT
+//            cancelled -- it becomes the protective stop, and it trails.
+//   STOPPED  the stop closes the position and (in SAR mode) opens the
+//            opposite one, so a live order is always waiting for the next move.
+//
+// Measured over 30 markets, 272,848 hourly bars and 20 years of daily bars
+// (STRADDLE_BOT.md). The short version:
+//
+//   * the signal is REAL. Against shuffled bars -- same shapes, same return
+//     distribution, only the ORDER destroyed -- it sits at the 100th
+//     percentile, on hourly and as a daily portfolio. It is capturing genuine
+//     serial correlation.
+//   * on HOURLY bars costs eat all of it. At zero spread the same system
+//     returns +17.0% a year; at the real spread, -3.3%. 18,413 trades.
+//   * on DAILY bars as a 30-market portfolio it beat buy-and-hold on return
+//     AND drawdown (19.9% vs 17.3% CAGR, 22.0% vs 30.4% max DD).
+//   * that outperformance is entirely BTC and ETH. Remove them and it is
+//     9.96% against hold's 14.38%, MAR 0.42 against 0.47. It loses.
+//
+// So: run it on daily bars or slower, as a portfolio, never on an hourly
+// chart, and know that the edge measured here lived in the two most strongly
+// trending markets in the sample.
+strategy("Straddle SAR — two-sided stops", overlay=true, calc_on_every_tick=false,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+         commission_type=strategy.commission.percent, commission_value=0.01,
+         slippage=2, initial_capital=100000, pyramiding=0,
+         process_orders_on_close=false)
+
+grpE = "Entry straddle"
+entryLen = input.int(20, "Entry channel (bars)", minval=2, group=grpE)
+grpX = "Trailing stop"
+trailMode = input.string("ATR", "Trail by", options=["ATR", "Donchian"], group=grpX)
+atrLen   = input.int(14, "ATR length", minval=2, group=grpX)
+atrMult  = input.float(3.0, "ATR multiple", minval=0.5, step=0.5, group=grpX)
+trailLen = input.int(10, "Donchian trail (bars)", minval=2, group=grpX)
+grpM = "Mode"
+useSar   = input.bool(false, "Stop-and-reverse (always in market)", group=grpM,
+   tooltip="OFF = go flat and re-arm the straddle. Measurably better: the flat variant can sit out a range, the SAR variant cannot.")
+
+// levels from CLOSED bars only -- these are the resting order prices
+up = ta.highest(high, entryLen)[1]
+dn = ta.lowest(low,  entryLen)[1]
+a  = ta.atr(atrLen)
+
+var float ext  = na
+var float stop = na
+
+flat  = strategy.position_size == 0
+longP = strategy.position_size > 0
+
+// track the extreme since entry, for the ATR trail
+if flat
+    ext := na
+else if longP
+    ext := na(ext) ? high : math.max(ext, high)
+else
+    ext := na(ext) ? low  : math.min(ext, low)
+
+rawStop = trailMode == "ATR"
+     ? (longP ? ext - atrMult * a : ext + atrMult * a)
+     : (longP ? ta.lowest(low, trailLen) : ta.highest(high, trailLen))
+
+// a trailing stop never loosens
+stop := flat ? na : na(stop) ? rawStop : (longP ? math.max(stop, rawStop) : math.min(stop, rawStop))
+
+if flat and not na(up) and not na(dn)
+    strategy.entry("L", strategy.long,  stop=up)
+    strategy.entry("S", strategy.short, stop=dn)
+else if not na(stop)
+    if longP
+        if useSar
+            strategy.entry("S", strategy.short, stop=stop)   // closes and reverses
+        else
+            strategy.exit("Lx", "L", stop=stop)
+    else
+        if useSar
+            strategy.entry("L", strategy.long, stop=stop)
+        else
+            strategy.exit("Sx", "S", stop=stop)
+
+plot(flat ? up : na,   "Buy stop",  color.new(color.teal, 0), 2, plot.style_linebr)
+plot(flat ? dn : na,   "Sell stop", color.new(color.red, 0),  2, plot.style_linebr)
+plot(flat ? na : stop, "Trail",     color.new(color.orange, 0), 2, plot.style_linebr)
+bgcolor(flat ? na : longP ? color.new(color.teal, 92) : color.new(color.red, 92))

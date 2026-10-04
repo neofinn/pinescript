@@ -5,3 +5,5 @@ fo/
 intra/
 idx/
 rag/store.pkl
+var/
+bots/__pycache__/
