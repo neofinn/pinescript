@@ -1,0 +1,65 @@
+//@version=5
+// Previous-day high / low: the levels, the session state, and the one
+// combination of eight that cleared zero.
+//
+// Measured over 30 markets and 19,761 sessions (PDH_PDL_COMBINATIONS.md):
+//
+//   base rates   78.0% of sessions break ONE side and hold. 9.8% take both.
+//                12.1% stay inside yesterday's range. Stable across all 30.
+//   fading       -0.26 to -0.38 R per trade over ~17,000 trades, and worse
+//                than shuffled data at the 0th percentile. Once a level
+//                breaks, the opposite one is reached just 11.2% of the time,
+//                so a fade is a bet on that 11.2%.
+//   second break all four reversal combinations are negative. The "trap
+//                reversal" long is -0.144 R, the worst cell of 96.
+//   following    beats every one of 30 within-session shuffles (100th
+//                percentile), so the continuation tendency is REAL -- and is
+//                worth +0.004 R once direction is neutralised, so it is
+//                already priced. Best of 96 cells: +0.022 R, PF 1.08.
+//
+// The strategy below is follow-only with a wide stop, which is the only thing
+// the measurement supports. The table shows the live session state.
+strategy("PDH / PDL break combinations", overlay=true, calc_on_every_tick=false,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+         commission_type=strategy.commission.percent, commission_value=0.01,
+         slippage=2, initial_capital=100000)
+
+takeLong  = input.bool(true,  "Long on the first PDH break",  group="Trades")
+takeShort = input.bool(true,  "Short on the first PDL break", group="Trades")
+atrLen    = input.int(14,  "ATR length", minval=2, group="Risk")
+atrMult   = input.float(3.0, "Stop = ATR x", minval=0.5, step=0.5, group="Risk",
+   tooltip="Wider was monotonically better: -0.042 R at 1x, +0.001 at 2x, +0.022 at 3x.")
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+// lookahead is safe here: high[1]/low[1] are YESTERDAY's completed values
+newDay = ta.change(time("D")) != 0
+a = ta.atr(atrLen)
+
+var bool brokeH = false
+var bool brokeL = false
+if newDay
+    brokeH := false
+    brokeL := false
+
+firstH = not brokeH and not brokeL and high >= pdh
+firstL = not brokeH and not brokeL and low  <= pdl
+if high >= pdh
+    brokeH := true
+if low <= pdl
+    brokeL := true
+
+flat = strategy.position_size == 0
+if firstH and takeLong and flat
+    strategy.entry("L", strategy.long, stop=pdh)
+    strategy.exit("Lx", "L", stop=pdh - atrMult * a)
+if firstL and takeShort and flat
+    strategy.entry("S", strategy.short, stop=pdl)
+    strategy.exit("Sx", "S", stop=pdl + atrMult * a)
+if strategy.position_size != 0 and newDay
+    strategy.close_all(comment="session close")
+
+plot(pdh, "PDH", color.new(color.teal, 0), 2, plot.style_linebr)
+plot(pdl, "PDL", color.new(color.red, 0),  2, plot.style_linebr)
+bgcolor(brokeH and brokeL ? color.new(color.orange, 90) : na,
+        title="both sides taken")
