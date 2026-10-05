@@ -1,0 +1,75 @@
+//@version=5
+// The 5 EMA setup, with an optional PCR gate. NIFTY / BANKNIFTY.
+//
+//   SHORT  a candle forms entirely ABOVE the 5 EMA (its LOW does not touch).
+//          Sell-stop at that candle's LOW, stop-loss at its HIGH.
+//   LONG   a candle forms entirely BELOW the 5 EMA (its HIGH does not touch).
+//          Buy-stop at that candle's HIGH, stop-loss at its LOW.
+//
+// Measured on NIFTY and BANKNIFTY -- 5,043 hourly and ~4,680 daily bars, plus
+// 548 trading days of PCR rebuilt from NSE's own F&O bhavcopy
+// (EMA5_PCR_NIFTY.md). What the numbers say:
+//
+//   * the setup alone is negative in 35 of 36 cells across both indices and
+//     three timeframes. Mean avg-R: short -0.30, long -0.17. PF 0.48-0.95.
+//   * PCR-OI -- the figure on every option-chain screen -- had NO measurable
+//     relationship with forward returns. All four OI measures sit at the 38th
+//     to 76th percentile of their own permutation distribution; Spearman
+//     +-0.03.
+//   * PCR-VOLUME does carry something, and it runs OPPOSITE to the textbook:
+//     heavy put volume preceded LOWER forward returns, not a bounce. All four
+//     volume measures negative across both indices, -35 to -54 bps over five
+//     days, and it survives controlling for the trailing return.
+//   * used as a filter it improved 10 of 12 cells by +0.070 avg-R -- and left
+//     1 of 12 positive, on 16 trades. It halves a loss; it does not make one.
+//
+// TradingView carries no NSE PCR feed, so the gate below takes an external
+// series. Wire it to your own PCR source and use a VOLUME ratio, not OI.
+strategy("5 EMA + PCR — NIFTY / BANKNIFTY", overlay=true,
+         calc_on_every_tick=false, default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10, commission_type=strategy.commission.percent,
+         commission_value=0.02, slippage=1, initial_capital=500000)
+
+grpS = "Setup"
+emaLen  = input.int(5, "EMA length", minval=2, group=grpS)
+useLong = input.bool(true,  "Long side",  group=grpS)
+useShrt = input.bool(true,  "Short side", group=grpS)
+rr      = input.float(2.0, "Reward : risk", minval=0.5, step=0.5, group=grpS)
+maxHold = input.int(24, "Max bars in trade", minval=1, group=grpS)
+
+grpP = "PCR gate (external)"
+usePcr  = input.bool(false, "Use the PCR gate", group=grpP)
+pcrSrc  = input.source(close, "PCR series", group=grpP,
+   tooltip="Point this at a PUT/CALL VOLUME ratio. The measured study found OI-based PCR had no predictive content; the volume ratio did.")
+pcrHi   = input.float(0.99, "Heavy put volume above", step=0.01, group=grpP)
+pcrLo   = input.float(0.91, "Light put volume below", step=0.01, group=grpP)
+
+e = ta.ema(close, emaLen)
+
+// both pattern bars are closed before the order rests, so nothing repaints
+shortSetup = low  > e
+longSetup  = high < e
+
+// measured direction: heavy put VOLUME favoured shorts, light favoured longs
+pcrOkShort = not usePcr or pcrSrc > pcrHi
+pcrOkLong  = not usePcr or pcrSrc < pcrLo
+
+flat = strategy.position_size == 0
+
+if shortSetup and useShrt and pcrOkShort and flat and high > low
+    strategy.entry("S", strategy.short, stop=low)
+    strategy.exit("Sx", "S", stop=high, limit=low - rr * (high - low))
+
+if longSetup and useLong and pcrOkLong and flat and high > low
+    strategy.entry("L", strategy.long, stop=high)
+    strategy.exit("Lx", "L", stop=low, limit=high + rr * (high - low))
+
+if strategy.position_size != 0 and
+   bar_index - strategy.opentrades.entry_bar_index(0) >= maxHold
+    strategy.close_all(comment="time")
+
+plot(e, "5 EMA", color.new(color.orange, 0), 2)
+plotshape(shortSetup and pcrOkShort, "short setup", shape.triangledown,
+          location.abovebar, color.new(color.red, 0), size=size.tiny)
+plotshape(longSetup and pcrOkLong, "long setup", shape.triangleup,
+          location.belowbar, color.new(color.teal, 0), size=size.tiny)
