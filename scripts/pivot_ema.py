@@ -82,8 +82,16 @@ def sessions(bars, period="day"):
 
 def run(bars, group="1", mode="bounce", ema_mode="none", ema_len=9,
         target="next", rr=2.0, stop_atr=0.5, cost_bps=2.0, one_per_day=True,
-        period="day"):
-    """One combination. Returns the trade list."""
+        period="day", use_bar_spread=False, spread_mult=1.0):
+    """One combination. Returns the trade list.
+
+    use_bar_spread charges the spread each bar actually carried, rather than a
+    flat basis-point figure. Bars built from Dukascopy ticks carry a "spread"
+    field holding the mean bid-ask over the bar; a round trip crosses it once
+    on the way in and once on the way out. Measured on gold the real spread is
+    about $0.58/oz, against the $0.32 this repo had been assuming -- so every
+    earlier gold cost figure is understated by roughly 1.8x.
+    """
     e = ema([b["c"] for b in bars], ema_len)
     a = atr(bars)
     ses = sessions(bars, period)
@@ -156,7 +164,12 @@ def run(bars, group="1", mode="bounce", ema_mode="none", ema_len=9,
                         px = targ; break
                 if px is None:
                     px = bars[idx[-1]]["c"]
-                net = (px - entry) * sgn - entry * cost_bps / 10_000.0
+                if use_bar_spread and "spread" in b:
+                    cost = spread_mult * (b.get("spread", 0.0)
+                                          + bars[idx[-1]].get("spread", 0.0))
+                else:
+                    cost = entry * cost_bps / 10_000.0
+                net = (px - entry) * sgn - cost
                 trades.append(dict(r=net / r, side=side, level=name,
                                    t=b["t"], bar=n, entry=entry, stop=stop,
                                    risk_px=r, exit=px))
