@@ -56,26 +56,37 @@ def atr(bars, n=14):
     return out
 
 
-def sessions(bars):
-    out, cur, day = [], [], None
+def sessions(bars, period="day"):
+    """Group bars into pivot periods.
+
+    period="day"  the usual: pivots from yesterday, walked intraday.
+    period="week" for DAILY bars, where each session is a single bar and the
+                  intraday walk has nowhere to happen. Weekly pivots walked on
+                  daily bars is the same construction one level up, and is the
+                  only way this setup is expressible on a daily chart.
+    """
+    key = (lambda d: d) if period == "day" else (lambda d: d.isocalendar()[:2])
+    out, cur, cz = [], [], None
     for i, b in enumerate(bars):
         d = dt.datetime.utcfromtimestamp(b["t"]).date()
-        if day is None or d != day:
+        k = key(d)
+        if cz is None or k != cz:
             if cur:
-                out.append((day, cur))
-            cur, day = [], d
+                out.append((cz, cur))
+            cur, cz = [], k
         cur.append(i)
     if cur:
-        out.append((day, cur))
+        out.append((cz, cur))
     return out
 
 
 def run(bars, group="1", mode="bounce", ema_mode="none", ema_len=9,
-        target="next", rr=2.0, stop_atr=0.5, cost_bps=2.0, one_per_day=True):
+        target="next", rr=2.0, stop_atr=0.5, cost_bps=2.0, one_per_day=True,
+        period="day"):
     """One combination. Returns the trade list."""
     e = ema([b["c"] for b in bars], ema_len)
     a = atr(bars)
-    ses = sessions(bars)
+    ses = sessions(bars, period)
     trades = []
     for k in range(1, len(ses)):
         _, pidx = ses[k - 1]

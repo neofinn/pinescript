@@ -28,7 +28,8 @@
 //     every row.
 indicator("Fib Pivots + 9 EMA — NIFTY", overlay=true)
 
-emaLen = input.int(9, "EMA length", minval=2, group="EMA")
+emaLen = input.int(9, "EMA length", minval=2, group="EMA",
+   tooltip="On gold, EMA 5 and EMA 9 give IDENTICAL results for pivot BREAK setups -- price sits on the same side of both averages on 89.6% of bars and a break is always in that 90%. The length only matters for BOUNCE setups, where EMA 5 was better (+0.102 vs -0.041 on h1 R1/S1).")
 showP  = input.bool(true,  "P",      group="Levels")
 show1  = input.bool(true,  "R1/S1",  group="Levels")
 show2  = input.bool(true,  "R2/S2",  group="Levels")
