@@ -147,7 +147,8 @@ def run(bars, group="1", mode="bounce", ema_mode="none", ema_len=9,
                     px = bars[idx[-1]]["c"]
                 net = (px - entry) * sgn - entry * cost_bps / 10_000.0
                 trades.append(dict(r=net / r, side=side, level=name,
-                                   t=b["t"], bar=n))
+                                   t=b["t"], bar=n, entry=entry, stop=stop,
+                                   risk_px=r, exit=px))
                 taken = True
                 break
     return trades
