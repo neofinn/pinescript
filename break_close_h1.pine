@@ -1,0 +1,73 @@
+//@version=5
+// Close beyond the prior candle, in that candle's direction. Both sides.
+//
+//   SHORT  the main candle closes RED; the NEXT candle closes BELOW its low.
+//          Stop = the main candle's high.
+//   LONG   the main candle closes GREEN; the NEXT candle closes ABOVE its high.
+//          Stop = the main candle's low.
+//
+// Measured over 30 hourly series, 730 days each, 35,617 trades
+// (BREAK_CLOSE_H1.md). What the numbers say, in order:
+//
+//   * the components work. The red/green requirement improves BOTH sides at
+//     every target tested and roughly halves the loss; requiring a body of at
+//     least 50% of the candle's range improves it again. Against a
+//     price-matched random control the pattern sits at the 100th percentile on
+//     every cell tested. There is real information in it.
+//   * it still loses. The short side is negative in 30 of 30 markets. Across
+//     18 target/hold combinations, 0 produced a positive combined total.
+//   * at RR 2.0 it wins 32.3% where a driftless random walk pays 33.3%. It is
+//     within one point of a fair coin, on the wrong side, and costs take more
+//     than that point is worth.
+//   * two-sided, 1% risk, compounding: it beat buy-and-hold in 1 of 30 markets
+//     (mean 0.887x against 1.689x).
+//
+// The body filter is exposed because it is the one knob that measurably
+// helped. It moves the result toward fair; it does not move it past fair.
+strategy("Break-Close Continuation — H1", overlay=true, calc_on_every_tick=false,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+         commission_type=strategy.commission.percent, commission_value=0.01,
+         slippage=1, initial_capital=50000)
+
+grpP     = "Pattern"
+useLong  = input.bool(true,  "Long side",  group=grpP)
+useShort = input.bool(true,  "Short side", group=grpP)
+bodyMin  = input.float(0.0, "Min body / range of the main candle", minval=0.0,
+                       maxval=0.95, step=0.05, group=grpP,
+                       tooltip="0 = any red/green close. 0.5 measurably reduced the loss.")
+grpR     = "Risk"
+rr       = input.float(2.0, "Reward : risk", minval=0.5, step=0.5, group=grpR)
+maxHold  = input.int(24, "Max bars in trade", minval=1, group=grpR)
+
+// main candle is bar[1]; the confirming close is this bar. Both are closed,
+// so nothing here repaints.
+mH = high[1], mL = low[1], mO = open[1], mC = close[1]
+rng  = mH - mL
+body = math.abs(mC - mO)
+ok   = rng > 0 and body >= bodyMin * rng
+
+shortSig = ok and useShort and mC < mO and close < mL
+longSig  = ok and useLong  and mC > mO and close > mH
+
+flat = strategy.position_size == 0
+
+if shortSig and flat and mH > close
+    r = mH - close
+    strategy.entry("S", strategy.short)
+    strategy.exit("Sx", "S", stop=mH, limit=close - rr * r)
+
+if longSig and flat and close > mL
+    r = close - mL
+    strategy.entry("L", strategy.long)
+    strategy.exit("Lx", "L", stop=mL, limit=close + rr * r)
+
+if strategy.position_size != 0 and
+   bar_index - strategy.opentrades.entry_bar_index(0) >= maxHold
+    strategy.close_all(comment="time")
+
+plotshape(shortSig, "short", shape.triangledown, location.abovebar,
+          color.new(color.red, 0), size=size.tiny)
+plotshape(longSig,  "long",  shape.triangleup,   location.belowbar,
+          color.new(color.teal, 0), size=size.tiny)
+plot(shortSig ? mH : longSig ? mL : na, "Stop", color.new(color.gray, 30), 2,
+     plot.style_linebr)

@@ -1,0 +1,252 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  EMA + VWAP CROSS   (from @austin.daytrades)
+//
+//  Rules as stated on screen, verbatim:
+//    "ADD THESE INDICATORS: 1. EMA  2. VWAP"
+//    "ENTRY ON 3 MINUTE TF"
+//    "ENTRY WHEN CANDLE WICKS THRU VWAP"   -> BUY PUTS (the bearish example)
+//    "EXIT WHEN CANDLE BREAKS THRU EMA"
+//    VWAP settings shown: Anchor Period = Session, Source = (O + H + L + C)/4
+//
+//  WHAT THE SOURCE DOES NOT SAY, and what is assumed here. Each of these is an
+//  input so you can put it back the way you meant it:
+//
+//  1. THE EMA LENGTH IS NEVER SHOWN. The settings dialog is opened for VWAP but
+//     not for the EMA. On the 3-minute charts in the clip the purple line turns
+//     tightly with price, which is a fast EMA -- 9 is the default here and 21
+//     is the other common reading. This is the single most consequential
+//     unknown in the script: it sets both the bias and the exit.
+//
+//  2. "WICKS THRU" is read as the wick piercing VWAP while the body does not:
+//     the candle trades through and closes back on its own side. That is a
+//     rejection. The looser reading -- any touch -- fires on nearly every bar
+//     that brushes VWAP, so the strict one is used and `requireClose` turns it
+//     off if you meant the loose one.
+//
+//  3. "CROSS" in the title is taken as the bias filter: the EMA on one side of
+//     VWAP decides which direction is allowed. Without it the same setup fires
+//     long and short at the same level. Off by `useBias` if you disagree.
+//
+//  4. NO STOP LOSS IS GIVEN. The only exit named is the EMA break. A trade that
+//     goes straight against you has no defined exit until price returns to the
+//     EMA, which can be far away -- and on options that is the whole premium.
+//     An optional ATR stop is provided, OFF by default so the script stays
+//     faithful to what was actually said. Turning it on changes the strategy.
+//
+//  NOT COMPILED. TradingView is the only Pine compiler and there is none in
+//  the environment this was written in. Checked for continuation indentation,
+//  local-scope var, plot inside blocks and alertcondition in a strategy, but
+//  never run on a chart.
+// ═══════════════════════════════════════════════════════════════════════════
+
+strategy("EMA + VWAP Cross", "EMAVWAP", overlay = true,
+ initial_capital = 25000,
+ default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+ pyramiding = 0, calc_on_every_tick = false, process_orders_on_close = false,
+ commission_type = strategy.commission.percent, commission_value = 0.02,
+ slippage = 1, max_labels_count = 500, max_lines_count = 500)
+
+// ── indicators ────────────────────────────────────────────────────────────
+G1 = "1 · Indicators"
+emaLen = input.int(9, "EMA length", minval = 1, group = G1,
+ tooltip = "NOT specified in the source. The clip never opens the EMA " +
+ "settings. 9 and 21 are the usual readings of a line that fast.")
+vwapSrcMode = input.string("(O+H+L+C)/4", "VWAP source",
+ options = ["(O+H+L+C)/4", "hlc3", "close"], group = G1,
+ tooltip = "The clip shows (O+H+L+C)/4 selected.")
+
+// ── entry ─────────────────────────────────────────────────────────────────
+G2 = "2 · Entry — wick through VWAP"
+requireClose = input.bool(true, "Body must close back on its own side",
+ group = G2, tooltip = "On: a true wick-through, price traded past VWAP and " +
+ "closed back. Off: any touch counts, which fires far more often.")
+minWickTicks = input.float(1.0, "Min penetration (ticks)", minval = 0.0,
+ step = 0.5, group = G2)
+useBias = input.bool(true, "Require EMA on the trade's side of VWAP",
+ group = G2, tooltip = "This is the 'CROSS' in the title: EMA above VWAP " +
+ "allows longs only, below allows shorts only.")
+allowLong = input.bool(true, "Longs (calls)", group = G2)
+allowShort = input.bool(true, "Shorts (puts)", group = G2)
+
+// ── exit ──────────────────────────────────────────────────────────────────
+G3 = "3 · Exit — break through EMA"
+exitOnClose = input.bool(true, "Exit on CLOSE beyond the EMA", group = G3,
+ tooltip = "On: close beyond the EMA. Off: any touch of the EMA.")
+useStop = input.bool(false, "Add an ATR stop (NOT in the source)", group = G3,
+ tooltip = "The source names no stop. Without one, an immediately adverse " +
+ "trade has no exit until price comes back to the EMA.")
+stopAtr = input.float(1.5, "  · stop distance (x ATR)", minval = 0.1,
+ step = 0.1, group = G3)
+atrLen = input.int(14, "  · ATR length", minval = 1, group = G3)
+useTimeStop = input.bool(false, "Give up after N bars", group = G3)
+maxBars = input.int(20, "  · bars", minval = 1, group = G3)
+
+// ── session ───────────────────────────────────────────────────────────────
+G4 = "4 · Session"
+useSess = input.bool(true, "Restrict to a session", group = G4)
+sessSpec = input.session("0930-1600", "Session", group = G4)
+flatAtEnd = input.bool(true, "Flat at session end", group = G4)
+
+G5 = "5 · Display"
+showDiag = input.bool(true, "Diagnostics table", group = G5)
+showMarks = input.bool(true, "Mark entries", group = G5)
+
+// ── measurements ──────────────────────────────────────────────────────────
+vwapSrc = vwapSrcMode == "(O+H+L+C)/4" ? ohlc4 :
+ vwapSrcMode == "hlc3" ? hlc3 : close
+vw = ta.vwap(vwapSrc)          // session-anchored, which is the shown setting
+em = ta.ema(close, emaLen)
+atr = ta.atr(atrLen)
+tick = syminfo.mintick
+pen = minWickTicks * tick
+
+inSess = not useSess or not na(time(timeframe.period, sessSpec))
+sessEnd = useSess and flatAtEnd and not inSess and inSess[1]
+
+// The clip trades this on 3-minute charts. Nothing stops it running elsewhere,
+// but a strategy tested on one timeframe and run on another is a different
+// strategy, so say so rather than letting it pass silently.
+tfWarn = timeframe.period != "3"
+
+// ── the wick-through ──────────────────────────────────────────────────────
+// Bullish: the low pierced BELOW VWAP and the close came back above it. Price
+// was offered under fair value for the session and buyers took it back.
+wickUnder = low < vw - pen
+wickOver = high > vw + pen
+closedAbove = close > vw
+closedBelow = close < vw
+
+bullWick = wickUnder and (not requireClose or closedAbove)
+bearWick = wickOver and (not requireClose or closedBelow)
+
+biasUp = not useBias or em > vw
+biasDn = not useBias or em < vw
+
+longSig = bullWick and biasUp and allowLong and inSess
+shortSig = bearWick and biasDn and allowShort and inSess
+
+// ── the EMA break ─────────────────────────────────────────────────────────
+breakDn = exitOnClose ? close < em : low < em
+breakUp = exitOnClose ? close > em : high > em
+
+// ── state ─────────────────────────────────────────────────────────────────
+var float entryPx = na
+var float stopPx = na
+var int entryBar = na
+
+var int nLong = 0
+var int nShort = 0
+var int nEmaExit = 0
+var int nStopExit = 0
+var int nTimeExit = 0
+var int nSessExit = 0
+
+flat = strategy.position_size == 0
+
+if longSig and flat and barstate.isconfirmed
+    strategy.entry("L", strategy.long, comment = "wick thru VWAP")
+    nLong += 1
+if shortSig and flat and barstate.isconfirmed
+    strategy.entry("S", strategy.short, comment = "wick thru VWAP")
+    nShort += 1
+
+justLong = strategy.position_size > 0 and nz(strategy.position_size[1]) <= 0
+justShort = strategy.position_size < 0 and nz(strategy.position_size[1]) >= 0
+
+if justLong
+    entryPx := strategy.position_avg_price
+    entryBar := bar_index
+    // clamp below the actual fill: a stop on the wrong side of its own entry
+    // books an instant loss that looks like the strategy failing
+    stopPx := useStop ? math.min(entryPx - nz(atr) * stopAtr, entryPx - tick) : na
+if justShort
+    entryPx := strategy.position_avg_price
+    entryBar := bar_index
+    stopPx := useStop ? math.max(entryPx + nz(atr) * stopAtr, entryPx + tick) : na
+
+// ── exits ─────────────────────────────────────────────────────────────────
+if strategy.position_size > 0
+    aged = useTimeStop and not na(entryBar) and bar_index - entryBar >= maxBars
+    if sessEnd
+        strategy.close("L", comment = "session")
+        nSessExit += 1
+    else if breakDn and barstate.isconfirmed
+        strategy.close("L", comment = "EMA break")
+        nEmaExit += 1
+    else if aged
+        strategy.close("L", comment = "time")
+        nTimeExit += 1
+    else if useStop and not na(stopPx)
+        strategy.exit("Lx", "L", stop = stopPx, comment = "stop")
+
+if strategy.position_size < 0
+    aged = useTimeStop and not na(entryBar) and bar_index - entryBar >= maxBars
+    if sessEnd
+        strategy.close("S", comment = "session")
+        nSessExit += 1
+    else if breakUp and barstate.isconfirmed
+        strategy.close("S", comment = "EMA break")
+        nEmaExit += 1
+    else if aged
+        strategy.close("S", comment = "time")
+        nTimeExit += 1
+    else if useStop and not na(stopPx)
+        strategy.exit("Sx", "S", stop = stopPx, comment = "stop")
+
+if strategy.position_size == 0
+    entryPx := na
+    stopPx := na
+    entryBar := na
+
+// ── drawing ───────────────────────────────────────────────────────────────
+pv = plot(vw, "VWAP", color.new(color.orange, 0), linewidth = 2)
+pe = plot(em, "EMA", color.new(color.purple, 0), linewidth = 2)
+fill(pv, pe, color = em > vw ? color.new(color.teal, 92)
+ : color.new(color.maroon, 92))
+
+plotshape(showMarks and longSig and flat, "Long", shape.triangleup,
+ location.belowbar, color.new(color.teal, 0), size = size.tiny)
+plotshape(showMarks and shortSig and flat, "Short", shape.triangledown,
+ location.abovebar, color.new(color.maroon, 0), size = size.tiny)
+plot(useStop and strategy.position_size != 0 ? stopPx : na, "Stop",
+ color.new(color.red, 0), style = plot.style_linebr)
+
+// ── diagnostics ───────────────────────────────────────────────────────────
+var table t = table.new(position.top_right, 2, 8, border_width = 1,
+ frame_width = 1, frame_color = color.gray)
+
+if showDiag and barstate.islast
+    table.cell(t, 0, 0, "EMA+VWAP", bgcolor = color.new(color.gray, 70),
+     text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 0, timeframe.period + (tfWarn ? " (not 3m)" : ""),
+     bgcolor = color.new(color.gray, 70), text_size = size.small,
+     text_color = tfWarn ? color.orange : color.white)
+    table.cell(t, 0, 1, "EMA length", text_size = size.small)
+    table.cell(t, 1, 1, str.tostring(emaLen) + " (assumed)",
+     text_size = size.small, text_color = color.orange)
+    table.cell(t, 0, 2, "long entries", text_size = size.small)
+    table.cell(t, 1, 2, str.tostring(nLong), text_size = size.small)
+    table.cell(t, 0, 3, "short entries", text_size = size.small)
+    table.cell(t, 1, 3, str.tostring(nShort), text_size = size.small)
+    table.cell(t, 0, 4, "exit: EMA break", text_size = size.small)
+    table.cell(t, 1, 4, str.tostring(nEmaExit), text_size = size.small)
+    table.cell(t, 0, 5, "exit: session", text_size = size.small)
+    table.cell(t, 1, 5, str.tostring(nSessExit), text_size = size.small)
+    table.cell(t, 0, 6, "exit: stop", text_size = size.small)
+    table.cell(t, 1, 6, useStop ? str.tostring(nStopExit) : "off",
+     text_size = size.small)
+    table.cell(t, 0, 7, "volume present", text_size = size.small)
+    // VWAP is a volume-weighted average. Without volume it silently degrades
+    // into an ordinary average, and Indian index symbols publish none.
+    volOk = not na(volume) and volume > 0
+    table.cell(t, 1, 7, volOk ? "yes" : "NO — VWAP INVALID",
+     text_size = size.small, text_color = volOk ? color.gray : color.red)
+
+// ── alerts ────────────────────────────────────────────────────────────────
+if longSig and flat and barstate.isconfirmed
+    alert("EMA+VWAP LONG " + syminfo.ticker + " @ " +
+     str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if shortSig and flat and barstate.isconfirmed
+    alert("EMA+VWAP SHORT " + syminfo.ticker + " @ " +
+     str.tostring(close, format.mintick), alert.freq_once_per_bar_close)

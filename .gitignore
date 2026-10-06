@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+n50/
+fo/
+intra/
+idx/
+rag/store.pkl
+var/
+bots/__pycache__/

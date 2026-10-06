@@ -1,0 +1,397 @@
+//@version=6
+// Volume profile + orderflow. Nothing else.
+//
+// No moving average, no RSI, no VWAP, no ATR, no time-of-day filter, no
+// volume surge. Every value below comes from one of two places: where volume
+// traded by price (the profile), or which side was aggressing (the flow).
+//
+// That constraint reaches the EXIT, which is the part usually fudged. A stop
+// in ATR is a volatility model from outside the profile, so there isn't one
+// here: the stop goes one row past the structure the trade leans on, and the
+// target is the next profile level. Flat at the close, because a developing
+// profile does not survive the bell.
+//
+// MEASURED RESULT, in ORDERFLOW_VOLUME_PROFILE.md: all five setups below were
+// run on twenty of the highest dollar-volume US names over 60 sessions,
+// against random entries carrying THE SAME stop/target geometry. None of the
+// fifteen instrument-window cells beat its control on more than one window.
+// Absorption at the value edge -- the most-cited of these setups -- came in at
+// PF 0.71-0.83 with a 24-29% hit rate. This file is published so the setups
+// can be looked at on a chart, not because the evidence supports trading them.
+
+strategy("VP + Orderflow (pure)", overlay = true,
+  max_boxes_count = 500, max_lines_count = 500,
+  default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+  initial_capital = 100000, commission_type = strategy.commission.percent,
+  commission_value = 0.01, process_orders_on_close = false)
+
+// ── inputs ───────────────────────────────────────────────────────────────
+gP = "Profile"
+rows    = input.int(60,    "Rows",          10, 200, group = gP)
+vaPct   = input.float(70,  "Value area %",  50, 95,  group = gP)
+nodeK   = input.float(1.5, "Node threshold (x mean row)", 1.0, 4.0, group = gP)
+updEvery= input.int(3, "Recompute every N bars", 1, 20, group = gP)
+
+gF = "Orderflow"
+absImb  = input.float(0.15, "Absorption imbalance",  0.0, 1.0, group = gF)
+lvnImb  = input.float(0.10, "Traverse imbalance",    0.0, 1.0, group = gF)
+
+gS = "Setup"
+setup = input.string("none", "Setup", group = gS, options =
+  ["none", "absorption at edge", "delta breakout", "LVN traverse",
+   "CVD divergence", "naked POC flow"],
+  tooltip = "Default none. Every one of these failed its control in the " +
+            "repo's test; see the header.")
+showLevels = input.bool(true, "Draw stop and target", group = gS)
+
+lowerTF = input.timeframe("1", "Sub-bar timeframe", group = "Data")
+
+// ── sub-bars ─────────────────────────────────────────────────────────────
+// Real 1-minute OHLCV inside this bar. What no feed carries is the AGGRESSOR
+// -- which side crossed the spread -- so delta below is the tick rule, which
+// tracked a 1-minute reconstruction at r = 0.68. Half the variance of the
+// thing it stands in for; a small reading is noise.
+[sH, sL, sC, sV] = request.security_lower_tf(syminfo.tickerid, lowerTF,
+  [high, low, close, volume])
+
+newSes = timeframe.change("D")
+
+barBuy = 0.0
+barSell = 0.0
+if array.size(sV) > 0
+    for i = 0 to array.size(sV) - 1
+        v = array.get(sV, i)
+        h = array.get(sH, i)
+        l = array.get(sL, i)
+        c = array.get(sC, i)
+        rg = h - l
+        up = rg > 0 ? (c - l) / rg : 0.5
+        barBuy += v * up
+        barSell += v * (1 - up)
+
+delta = barBuy - barSell
+barVol = barBuy + barSell
+imb = barVol > 0 ? delta / barVol : 0.0
+
+var int sesBars = 0
+sesBars := newSes ? 1 : sesBars + 1
+
+var float cvd = 0.0
+var float cvdHi = 0.0
+var float cvdLo = 0.0
+var float pxHi = na
+var float pxLo = na
+// previous bar's running extremes, so "new extreme" means THIS bar made it
+cvdHiPrev = cvdHi
+cvdLoPrev = cvdLo
+
+if newSes
+    cvd := delta
+    cvdHi := delta
+    cvdLo := delta
+    pxHi := high
+    pxLo := low
+else
+    cvd := cvd + delta
+    cvdHi := math.max(cvdHi, cvd)
+    cvdLo := math.min(cvdLo, cvd)
+    pxHi := math.max(nz(pxHi, high), high)
+    pxLo := math.min(nz(pxLo, low), low)
+
+// ── session sub-bar store ────────────────────────────────────────────────
+var array<float> pH = array.new_float()
+var array<float> pL = array.new_float()
+var array<float> pV = array.new_float()
+
+if newSes
+    array.clear(pH)
+    array.clear(pL)
+    array.clear(pV)
+
+if array.size(sV) > 0
+    for i = 0 to array.size(sV) - 1
+        array.push(pH, array.get(sH, i))
+        array.push(pL, array.get(sL, i))
+        array.push(pV, array.get(sV, i))
+
+// ── profile ──────────────────────────────────────────────────────────────
+// Volume is spread across each sub-bar's range in proportion to the part of
+// that range falling in each row. Rebuilt from 1m instead of 5m bars the POC
+// moved a median 0.23 ATR and 2.56 ATR at the 90th percentile, so the level
+// is not stable to the decimal a chart draws it at.
+build(array<float> aH, array<float> aL, array<float> aV, int nRows, float vaFrac) =>
+    n = array.size(aV)
+    float lo = na
+    float hi = na
+    float poc = na
+    float vah = na
+    float val = na
+    array<float> hist = array.new_float(nRows, 0.0)
+    if n > 0
+        lo := array.min(aL)
+        hi := array.max(aH)
+        w = (hi - lo) / nRows
+        if w > 0
+            for i = 0 to n - 1
+                v = array.get(aV, i)
+                if v > 0
+                    bl = array.get(aL, i)
+                    bh = array.get(aH, i)
+                    // a <= b always, so this never runs backwards. Pine counts
+                    // DOWN when `to` is below `from`, which turns an empty
+                    // range into a silent wrong answer.
+                    a = math.max(0, math.min(nRows - 1, int((bl - lo) / w)))
+                    b = math.max(0, math.min(nRows - 1, int((bh - lo) / w)))
+                    span = bh - bl
+                    if span <= 0
+                        array.set(hist, a, array.get(hist, a) + v)
+                    else
+                        for k = a to b
+                            s = lo + k * w
+                            e = s + w
+                            ov = math.min(bh, e) - math.max(bl, s)
+                            if ov > 0
+                                array.set(hist, k, array.get(hist, k) + v * ov / span)
+            // CBOT value area: expand from the POC taking the heavier pair.
+            // This is why the area is asymmetric and a standard deviation is
+            // a different object.
+            total = array.sum(hist)
+            pi = array.indexof(hist, array.max(hist))
+            acc = array.get(hist, pi)
+            loI = pi
+            hiI = pi
+            target = total * vaFrac
+            while acc < target and (loI > 0 or hiI < nRows - 1)
+                up = hiI < nRows - 1 ? array.get(hist, hiI + 1) +
+                     (hiI + 2 < nRows ? array.get(hist, hiI + 2) : 0.0) : -1.0
+                dn = loI > 0 ? array.get(hist, loI - 1) +
+                     (loI - 2 >= 0 ? array.get(hist, loI - 2) : 0.0) : -1.0
+                if up >= dn and hiI < nRows - 1
+                    for _r = 1 to math.min(2, nRows - 1 - hiI)
+                        hiI += 1
+                        acc += array.get(hist, hiI)
+                else if loI > 0
+                    for _r = 1 to math.min(2, loI)
+                        loI -= 1
+                        acc += array.get(hist, loI)
+                else
+                    break
+            poc := lo + (pi + 0.5) * w
+            val := lo + loI * w
+            vah := lo + (hiI + 1) * w
+    [hist, lo, hi, poc, vah, val]
+
+var array<float> dHist = array.new_float(rows, 0.0)
+var float dLo = na
+var float dHi = na
+var float dPOC = na
+var float dVAH = na
+var float dVAL = na
+
+if (barstate.islast or newSes or bar_index % updEvery == 0) and array.size(pV) > 0
+    [h_, lo_, hi_, p_, a_, b_] = build(pH, pL, pV, rows, vaPct / 100.0)
+    dHist := h_
+    dLo := lo_
+    dHi := hi_
+    dPOC := p_
+    dVAH := a_
+    dVAL := b_
+
+// ── prior-session nodes and naked POCs ───────────────────────────────────
+// Frozen at the open, so nothing a signal uses can move under it afterwards.
+var array<float> pHVN = array.new_float()
+var array<float> pLVN = array.new_float()
+var array<float> naked = array.new_float()
+var float pRow = na
+
+if newSes and not na(dPOC) and dHi > dLo
+    pRow := (dHi - dLo) / rows
+    array.clear(pHVN)
+    array.clear(pLVN)
+    mean = array.avg(dHist)
+    for k = 1 to rows - 2
+        v = array.get(dHist, k)
+        px = dLo + (k + 0.5) * pRow
+        if v > mean * nodeK and v >= array.get(dHist, k - 1) and v >= array.get(dHist, k + 1)
+            array.push(pHVN, px)
+        if v < mean / nodeK and v <= array.get(dHist, k - 1) and v <= array.get(dHist, k + 1)
+            array.push(pLVN, px)
+    array.push(naked, dPOC)
+
+// a POC stops being naked the moment price trades through it. Walking
+// forward is the only way to know that; computing it from finished data
+// would mark levels naked that the day already cleared.
+if array.size(naked) > 0
+    for k = array.size(naked) - 1 to 0
+        p = array.get(naked, k)
+        if low <= p and p <= high
+            array.remove(naked, k)
+
+nearestAbove(array<float> a, float px) =>
+    float best = na
+    if array.size(a) > 0
+        for i = 0 to array.size(a) - 1
+            v = array.get(a, i)
+            if v > px and (na(best) or v < best)
+                best := v
+    best
+
+nearestBelow(array<float> a, float px) =>
+    float best = na
+    if array.size(a) > 0
+        for i = 0 to array.size(a) - 1
+            v = array.get(a, i)
+            if v < px and (na(best) or v > best)
+                best := v
+    best
+
+// ── the five combined setups ─────────────────────────────────────────────
+// Each needs BOTH layers. A level alone fires nothing and a flow reading
+// alone fires nothing -- otherwise this would just be the profile-only test
+// again under a new name.
+// The warm-up is the profile's own, not a time filter: a "value area" over
+// two candles is a number without a meaning, and on bar one of a session the
+// cvd extremes still belong to yesterday.
+ready = not na(dVAH) and not na(dVAL) and not na(dPOC) and not na(pRow)
+  and sesBars >= 6
+vaW = ready ? dVAH - dVAL : na
+
+int   sSide = 0
+float sStop = na
+float sTarg = na
+
+if ready
+    if setup == "absorption at edge"
+        // aggressive flow into the edge that does not get paid
+        if high >= dVAH and close < dVAH and imb > absImb
+            sSide := -1
+            sStop := high + pRow
+            sTarg := dPOC
+        if low <= dVAL and close > dVAL and imb < -absImb
+            sSide := 1
+            sStop := low - pRow
+            sTarg := dPOC
+
+    if setup == "delta breakout"
+        // the cvd condition separates a break the auction is funding from one
+        // bar of noise poking out of the range
+        if close > dVAH and imb > 0 and cvd >= cvdHi
+            t = nearestAbove(naked, close)
+            sSide := 1
+            sStop := dVAH - pRow
+            sTarg := na(t) ? nearestAbove(pHVN, close) : t
+            sTarg := na(sTarg) ? close + vaW : sTarg
+        if close < dVAL and imb < 0 and cvd <= cvdLo
+            t = nearestBelow(naked, close)
+            sSide := -1
+            sStop := dVAL + pRow
+            sTarg := na(t) ? nearestBelow(pHVN, close) : t
+            sTarg := na(sTarg) ? close - vaW : sTarg
+
+    if setup == "LVN traverse"
+        // little traded there, so little resting interest to slow price --
+        // but only if someone is pushing, which is the flow half
+        if array.size(pLVN) > 0
+            for i = 0 to array.size(pLVN) - 1
+                lv = array.get(pLVN, i)
+                if close[1] <= lv and lv < close and imb > lvnImb and sSide == 0
+                    t = nearestAbove(pHVN, close)
+                    if not na(t)
+                        sSide := 1
+                        sStop := lv - pRow
+                        sTarg := t
+                if close[1] >= lv and lv > close and imb < -lvnImb and sSide == 0
+                    t = nearestBelow(pHVN, close)
+                    if not na(t)
+                        sSide := -1
+                        sStop := lv + pRow
+                        sTarg := t
+
+    if setup == "CVD divergence"
+        // a new price extreme the flow behind it does not confirm, taken AT
+        // the value edge rather than anywhere on the chart
+        if high >= pxHi and high >= dVAH and cvd < cvdHiPrev
+            sSide := -1
+            sStop := high + pRow
+            sTarg := dPOC
+        if low <= pxLo and low <= dVAL and cvd > cvdLoPrev
+            sSide := 1
+            sStop := low - pRow
+            sTarg := dPOC
+
+    if setup == "naked POC flow"
+        // the magnet story needs someone pulling
+        if array.size(naked) > 0
+            float p = na
+            for i = 0 to array.size(naked) - 1
+                v = array.get(naked, i)
+                if na(p) or math.abs(v - close) < math.abs(p - close)
+                    p := v
+            d = p - close
+            if math.abs(d) >= pRow and math.abs(d) <= vaW
+                if d > 0 and imb > lvnImb
+                    st = nearestBelow(pHVN, close)
+                    sSide := 1
+                    sStop := na(st) ? close - vaW * 0.5 : st - pRow
+                    sTarg := p
+                if d < 0 and imb < -lvnImb
+                    st = nearestAbove(pHVN, close)
+                    sSide := -1
+                    sStop := na(st) ? close + vaW * 0.5 : st + pRow
+                    sTarg := p
+
+// geometry has to be real before it becomes an order: a stop on the wrong
+// side of the fill is not a trade, it is a bug that books a profit
+valid = sSide != 0 and not na(sStop) and not na(sTarg) and
+  sSide * (close - sStop) > 0 and sSide * (sTarg - close) > 0
+
+// ── orders ───────────────────────────────────────────────────────────────
+if valid and strategy.position_size == 0
+    if sSide > 0
+        strategy.entry("L", strategy.long)
+        strategy.exit("Lx", "L", stop = sStop, limit = sTarg)
+    else
+        strategy.entry("S", strategy.short)
+        strategy.exit("Sx", "S", stop = sStop, limit = sTarg)
+
+// flat at the bell: a developing profile does not carry across the session
+if newSes and strategy.position_size != 0
+    strategy.close_all("session end")
+
+// ── drawing ──────────────────────────────────────────────────────────────
+var array<box> vbox = array.new<box>()
+if barstate.islast
+    if array.size(vbox) > 0
+        for i = 0 to array.size(vbox) - 1
+            box.delete(array.get(vbox, i))
+    array.clear(vbox)
+    if not na(dLo) and dHi > dLo
+        w = (dHi - dLo) / rows
+        mx = array.max(dHist)
+        mean = array.avg(dHist)
+        for k = 0 to rows - 1
+            v = array.get(dHist, k)
+            if v > 0 and mx > 0
+                mid = dLo + (k + 0.5) * w
+                len = math.max(1, int(50 * v / mx))
+                inVA = mid >= dVAL and mid <= dVAH
+                col = inVA ? color.new(color.teal, 72) : color.new(color.gray, 85)
+                if v > mean * nodeK
+                    col := color.new(color.orange, 60)
+                if v < mean / nodeK
+                    col := color.new(color.blue, 88)
+                array.push(vbox, box.new(bar_index - len, dLo + (k + 1) * w,
+                  bar_index, dLo + k * w, border_width = 0, bgcolor = col))
+
+plot(ready ? dPOC : na, "POC", color.red,  2, plot.style_linebr)
+plot(ready ? dVAH : na, "VAH", color.teal, 1, plot.style_linebr)
+plot(ready ? dVAL : na, "VAL", color.teal, 1, plot.style_linebr)
+plot(showLevels and valid ? sStop : na, "Stop",   color.red,  1, plot.style_circles)
+plot(showLevels and valid ? sTarg : na, "Target", color.lime, 1, plot.style_circles)
+plot(cvd, "Cumulative delta", color.orange, display = display.data_window)
+plot(delta, "Delta", color.gray, display = display.data_window)
+
+plotshape(valid and sSide > 0, "Long",  shape.triangleup,   location.belowbar,
+  color.new(color.teal, 20), size = size.tiny)
+plotshape(valid and sSide < 0, "Short", shape.triangledown, location.abovebar,
+  color.new(color.red, 20),  size = size.tiny)

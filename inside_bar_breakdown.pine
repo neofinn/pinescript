@@ -1,0 +1,91 @@
+//@version=5
+// Inside-bar breakdown short at a swing high.
+//
+// 1. a candle makes a new high over the lookback
+// 2. the next candle forms entirely INSIDE it, and is small enough
+// 3. short when that inside candle's low is broken
+//
+// Everything the plain-English description leaves open is an input, because
+// each one changes the result materially:
+//   Lookback   what "the high" means. A literal all-time high fires a handful
+//              of times a decade; a 20-bar high fires often.
+//   Max size   what "small" means, as a fraction of the reference bar's range.
+//              1.0 turns the filter off and accepts any inside bar.
+//   Entry      break vs close. On the backtests in this repo the break entry
+//              lost in every parameter cell and the close entry did not.
+//   Valid for  how many bars the trigger stays live before it goes stale.
+//
+// Read INSIDE_BAR_SHORT.md before trading this. The measured result there is
+// that the edge over a matched control is not distinguishable from zero.
+//
+// On GOLD specifically (GOLD_INSIDE_BAR.md): GC=F 30m is the best this pattern
+// looked anywhere -- +0.144 R per trade, 17 of 42 cells positive -- but on 38
+// trades, 95% CI [-0.293, +0.597]. The same metal is significantly negative on
+// the hourly over 2.4 years (-0.429 R) and on the daily over 20 (-0.398 R), and
+// GLD and IAU, two ETFs holding the identical metal over the identical 60 days,
+// disagree about the sign. Defaults below are the best gold 30m cell.
+strategy("Inside-Bar Breakdown Short", overlay=true, calc_on_every_tick=false,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+         commission_type=strategy.commission.percent, commission_value=0.015,
+         slippage=2, initial_capital=50000, process_orders_on_close=false)
+
+grpP = "Pattern"
+lookback = input.int(20,  "Lookback for the high",  minval=2,  group=grpP)
+sizeMax  = input.float(1.0, "Max inside range / ref range", minval=0.05, maxval=1.0, step=0.05, group=grpP)
+validBar = input.int(3,   "Trigger valid for (bars)", minval=1, group=grpP)
+onClose  = input.bool(true, "Enter on CLOSE below (not on the break)", group=grpP)   // best gold 30m cell
+
+grpR = "Risk"
+rr       = input.float(2.0, "Reward : risk", minval=0.5, step=0.5, group=grpR)
+stopRef  = input.string("Inside bar high", "Stop above", options=["Inside bar high", "Reference bar high"], group=grpR)
+maxHold  = input.int(16, "Max bars in trade", minval=1, group=grpR)
+
+// --- pattern -----------------------------------------------------------
+// bar[1] is the reference, bar[0] is the inside bar. Both are closed, so the
+// trigger published here is causal and never repaints.
+priorHigh = ta.highest(high, lookback)[2]
+isNewHigh = high[1] > priorHigh
+refRange  = high[1] - low[1]
+isInside  = high <= high[1] and low >= low[1]
+isSmall   = refRange > 0 and (high - low) <= sizeMax * refRange
+setup     = isNewHigh and isInside and isSmall
+
+var float trigger  = na
+var float insideHi = na
+var float refHi     = na
+var int   armedBar  = na
+
+if setup
+    trigger  := low
+    insideHi := high
+    refHi    := high[1]
+    armedBar := bar_index
+
+armed = not na(armedBar) and bar_index - armedBar <= validBar and bar_index > armedBar
+
+// --- entry -------------------------------------------------------------
+stopPx = stopRef == "Inside bar high" ? insideHi : refHi
+flat   = strategy.position_size == 0
+
+if armed and flat and not na(trigger) and stopPx > trigger
+    if onClose
+        if close < trigger
+            r = stopPx - close
+            strategy.entry("S", strategy.short)
+            strategy.exit("X", "S", stop=stopPx, limit=close - rr * r)
+            armedBar := na
+    else
+        // a resting stop-sell; TradingView fills it at the open on a gap,
+        // which is the same pessimistic assumption the Python study makes
+        r = stopPx - trigger
+        strategy.entry("S", strategy.short, stop=trigger)
+        strategy.exit("X", "S", stop=stopPx, limit=trigger - rr * r)
+
+if strategy.position_size < 0 and bar_index - strategy.opentrades.entry_bar_index(0) >= maxHold
+    strategy.close("S", comment="time")
+
+// --- drawing -----------------------------------------------------------
+plotshape(setup, "Setup", shape.triangledown, location.abovebar, color.new(color.orange, 0), size=size.tiny)
+plot(armed and flat ? trigger : na, "Trigger", color.new(color.red, 0), 2, plot.style_linebr)
+plot(armed and flat ? stopPx  : na, "Stop",    color.new(color.gray, 40), 1, plot.style_linebr)
+bgcolor(setup ? color.new(color.orange, 88) : na)

@@ -1,0 +1,187 @@
+//@version=6
+// 3-timeframe PDH/PDL system — daily levels, 15M breakout, 5M retest + candle
+//
+// Run this on a 5-MINUTE chart. It reads the daily level and the 15M breakout
+// through request.security, so the chart timeframe must be the execution one.
+//
+// Measured on 50 sessions of gold and 58 of NIFTY (Yahoo serves no more than
+// about sixty days of 5-minute bars, so this is one regime and a small sample):
+//
+//   GOLD GC=F   1:2 RR both sides   117 trades  40.2% win  PF 1.13
+//               shorts only          49 trades  46.9% win  PF 1.49
+//               longs only           68 trades  35.3% win  PF 0.91
+//   NIFTY       1:2 RR both sides    83 trades  28.9% win  PF 0.61  -- did not work
+//
+// Three things the test settled about the design itself:
+//
+//   * The candle confirmation is the most valuable part. Taking a plain retest
+//     with no hammer or engulfing halves it: 1.13 -> 0.52 on gold, 0.61 -> 0.31
+//     on NIFTY. Keep that filter.
+//   * The 1:2 to 1:3 target range is right. Across 1:1, 1:1.5, 1:2, 1:2.5, 1:3
+//     and 1:4 gold reads 0.83, 1.01, 1.13, 1.04, 1.09, 0.95 -- a hump centred
+//     exactly where the system specifies.
+//   * A tight retest matters. Allowing price to come back only 0.05-0.15% of
+//     the level holds up; 0.3% and beyond degrades to 0.95 and then 0.80.
+//
+// And the one structural problem. A stop at the 5-minute candle low is a median
+// 4.2 basis points of price, so 1bp of round-turn cost is roughly a quarter of
+// 1R. Gold reads 1.34 at zero cost, 1.13 at 1bp, 0.96 at 2bp and 0.61 at 5bp.
+// The stop buffer input below exists for that reason -- widening the stop is
+// what makes this survivable on a real spread.
+
+strategy("3TF PDH/PDL — 15M breakout, 5M retest",
+     overlay                 = true,
+     initial_capital         = 1000000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.01,
+     slippage                = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false)
+
+gL = "Levels"
+lvlTF   = input.timeframe("D",  "Level timeframe (PDH/PDL from)", group = gL)
+boTF    = input.timeframe("15", "Breakout timeframe", group = gL)
+showLvl = input.bool(true, "Draw the levels", group = gL)
+
+gE = "Entry"
+retestTol = input.float(0.15, "Retest tolerance, % of price  (measured: 0.05-0.15 works)",
+     minval = 0.01, maxval = 1.0, step = 0.05, group = gE)
+needPat   = input.bool(true, "Require hammer / engulfing  (removing it halves PF)", group = gE)
+takeLong  = input.bool(true, "Take longs", group = gE)
+takeShort = input.bool(true, "Take shorts", group = gE)
+oneADay   = input.bool(true, "At most one trade per side per session", group = gE)
+
+gX = "Exit"
+rrTarget  = input.float(2.0, "Target, R multiple  (measured best 2.0-3.0)",
+     minval = 0.5, step = 0.5, group = gX)
+stopBuf   = input.float(0.0, "Stop buffer beyond the candle, % of price",
+     minval = 0.0, maxval = 0.5, step = 0.01, group = gX)
+flatEOD   = input.bool(false, "Close anything still open at session end", group = gX)
+
+// ─── daily levels, non-repainting ──────────────────────────────────────────
+// high[1] on the higher timeframe with lookahead_on is the standard idiom for
+// a PREVIOUS period value: the bar it refers to is already closed, so nothing
+// is borrowed from the future.
+pdh = request.security(syminfo.tickerid, lvlTF, high[1],
+     lookahead = barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, lvlTF, low[1],
+     lookahead = barmerge.lookahead_on)
+
+// ─── the 15M breakout, from CLOSED bars only ───────────────────────────────
+// close[1] with lookahead_off is the last completed bar of the breakout
+// timeframe. Using close would read a 15M bar that is still forming and the
+// signal would repaint as it moved.
+c15 = request.security(syminfo.tickerid, boTF, close[1],
+     lookahead = barmerge.lookahead_off)
+
+newSession = ta.change(time(lvlTF)) != 0
+
+var bool brokeUp = false
+var bool brokeDn = false
+var bool tookL   = false
+var bool tookS   = false
+if newSession
+    brokeUp := false
+    brokeDn := false
+    tookL   := false
+    tookS   := false
+if not na(c15) and not na(pdh) and c15 > pdh
+    brokeUp := true
+if not na(c15) and not na(pdl) and c15 < pdl
+    brokeDn := true
+
+// ─── candle patterns ───────────────────────────────────────────────────────
+body  = math.abs(close - open)
+upWick= high - math.max(open, close)
+dnWick= math.min(open, close) - low
+
+isHammer = body > 0 and dnWick >= 2 * body and upWick <= body and close >= open
+isStar   = body > 0 and upWick >= 2 * body and dnWick <= body and close <= open
+bullEng  = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bearEng  = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+
+patL = not needPat or isHammer or bullEng
+patS = not needPat or isStar   or bearEng
+
+// ─── retest and entry ──────────────────────────────────────────────────────
+tol      = retestTol / 100.0
+retestL  = not na(pdh) and low  <= pdh * (1 + tol) and close > pdh * (1 - tol)
+retestS  = not na(pdl) and high >= pdl * (1 - tol) and close < pdl * (1 + tol)
+
+goLong  = takeLong  and brokeUp and retestL and patL and (not oneADay or not tookL)
+goShort = takeShort and brokeDn and retestS and patS and (not oneADay or not tookS)
+
+// the stop sits beyond the signal candle, optionally with a buffer, because an
+// unbuffered 5-minute low is a stop so tight that costs dominate the result
+buf = stopBuf / 100.0
+var float entryPx = na
+var float stopPx  = na
+var float targPx  = na
+
+if goLong and strategy.position_size == 0
+    entryPx := close
+    stopPx  := low * (1 - buf)
+    risk     = entryPx - stopPx
+    if risk > 0
+        targPx := entryPx + rrTarget * risk
+        strategy.entry("L", strategy.long)
+        strategy.exit("L-x", "L", stop = stopPx, limit = targPx)
+        tookL := true
+
+if goShort and strategy.position_size == 0
+    entryPx := close
+    stopPx  := high * (1 + buf)
+    risk     = stopPx - entryPx
+    if risk > 0
+        targPx := entryPx - rrTarget * risk
+        strategy.entry("S", strategy.short)
+        strategy.exit("S-x", "S", stop = stopPx, limit = targPx)
+        tookS := true
+
+if flatEOD and newSession and strategy.position_size != 0
+    strategy.close_all(comment = "session end")
+
+// ─── drawing ───────────────────────────────────────────────────────────────
+plot(showLvl ? pdh : na, "PDH", color.new(color.teal, 0), 2, plot.style_stepline)
+plot(showLvl ? pdl : na, "PDL", color.new(color.maroon, 0), 2, plot.style_stepline)
+plot(strategy.position_size != 0 ? stopPx : na, "Stop",
+     color.new(color.red, 0), 1, plot.style_linebr)
+plot(strategy.position_size != 0 ? targPx : na, "Target",
+     color.new(color.green, 0), 1, plot.style_linebr)
+
+plotshape(goLong  and strategy.position_size == 0, "BUY", shape.labelup,
+     location.belowbar, color.new(color.teal, 0), text = "BUY",
+     textcolor = color.white, size = size.small)
+plotshape(goShort and strategy.position_size == 0, "SELL", shape.labeldown,
+     location.abovebar, color.new(color.maroon, 0), text = "SELL",
+     textcolor = color.white, size = size.small)
+
+bgcolor(brokeUp and not brokeDn ? color.new(color.teal, 95) :
+     brokeDn and not brokeUp ? color.new(color.maroon, 95) : na, title = "Breakout state")
+
+var table tb = table.new(position.top_right, 2, 4,
+     bgcolor = color.new(color.black, 20), border_width = 1)
+if barstate.islast
+    table.cell(tb, 0, 0, "PDH", text_color = color.gray, text_size = size.tiny)
+    table.cell(tb, 1, 0, str.tostring(pdh, format.mintick),
+         text_color = color.teal, text_size = size.tiny)
+    table.cell(tb, 0, 1, "PDL", text_color = color.gray, text_size = size.tiny)
+    table.cell(tb, 1, 1, str.tostring(pdl, format.mintick),
+         text_color = color.maroon, text_size = size.tiny)
+    table.cell(tb, 0, 2, "15M broke", text_color = color.gray, text_size = size.tiny)
+    table.cell(tb, 1, 2, brokeUp ? "UP" : brokeDn ? "DOWN" : "no",
+         text_color = brokeUp ? color.lime : brokeDn ? color.red : color.gray,
+         text_size = size.tiny)
+    table.cell(tb, 0, 3, "waiting for", text_color = color.gray, text_size = size.tiny)
+    table.cell(tb, 1, 3, brokeUp ? "retest + hammer/engulf" :
+         brokeDn ? "retest + star/engulf" : "15M close beyond level",
+         text_color = color.white, text_size = size.tiny)
+
+if goLong and strategy.position_size == 0
+    alert("BUY — PDH retest with bullish candle at " + str.tostring(close, format.mintick),
+         alert.freq_once_per_bar_close)
+if goShort and strategy.position_size == 0
+    alert("SELL — PDL retest with bearish candle at " + str.tostring(close, format.mintick),
+         alert.freq_once_per_bar_close)
