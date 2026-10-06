@@ -1,0 +1,71 @@
+//@version=5
+// Opening-range breakout on the first 30-minute candle.
+//
+// Measured over 20 markets and 1,101 trades, 227 of them Nasdaq
+// (ORB30_NASDAQ.md):
+//
+//   * at 1:2 on the Nasdaq it returns -0.143 R per trade. Only 5% of trades
+//     ever reach the target; 57% never resolve and exit at the bell.
+//   * of the trades that DO resolve, 15.7% hit 2R where a driftless random
+//     walk pays 33.3%. The geometry is why: the stop is the full opening
+//     range, so the 2R target sits THREE range widths from the far side -- the
+//     day must extend two whole opening ranges inside the remaining six hours.
+//   * at 1:1 the target is hit 50.7% of resolved trades, exactly the
+//     random-walk value, and the setup is within costs of break-even
+//     (-0.025 R, PF 0.94). The TARGET is the problem, not the entry.
+//   * opening-range WIDTH correlates +0.617 with average R. Wide openers
+//     (>=80bp) mean -0.011; narrow (<50bp) mean -0.165. The only two positive
+//     markets of twenty are AAPL and NVDA, which open three times wider than
+//     QQQ. Nasdaq index products are among the narrowest in the sample.
+//   * halving the stop is worse in every column.
+//   * against 40 within-session shuffles the real sequence wins 100/100, so
+//     the opening range IS a genuine level. It is just not worth 2R.
+//
+// Default RR is 1.0 because that is what the measurement supports.
+strategy("Opening Range Breakout — first M30", overlay=true,
+         calc_on_every_tick=false, default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10, commission_type=strategy.commission.percent,
+         commission_value=0.01, slippage=2, initial_capital=100000)
+
+sessTime = input.session("0930-1600", "Regular session", group="Session")
+orMins   = input.int(30, "Opening range (minutes)", minval=5, group="Session")
+rr       = input.float(1.0, "Reward : risk", minval=0.5, step=0.5, group="Risk",
+   tooltip="1.0 measured -0.025 R with the target hit at the random-walk rate. 2.0 measured -0.143 R with it hit at 12.4% against a 33.3% baseline.")
+oneOnly  = input.bool(true, "First break of the session only", group="Risk")
+
+inSess  = not na(time(timeframe.period, sessTime))
+newSess = inSess and not inSess[1]
+sessMs  = (time - valuewhen(newSess, time, 0))
+inOR    = inSess and sessMs < orMins * 60 * 1000
+
+var float orH = na
+var float orL = na
+var bool  done = false
+if newSess
+    orH := high
+    orL := low
+    done := false
+else if inOR
+    orH := math.max(orH, high)
+    orL := math.min(orL, low)
+
+ready = inSess and not inOR and not na(orH) and orH > orL
+flat  = strategy.position_size == 0
+
+if ready and flat and not (done and oneOnly)
+    r = orH - orL
+    if high >= orH
+        strategy.entry("L", strategy.long, stop=orH)
+        strategy.exit("Lx", "L", stop=orL, limit=orH + rr * r)
+        done := true
+    else if low <= orL
+        strategy.entry("S", strategy.short, stop=orL)
+        strategy.exit("Sx", "S", stop=orH, limit=orL - rr * r)
+        done := true
+
+if strategy.position_size != 0 and inSess[1] and not inSess
+    strategy.close_all(comment="session close")
+
+plot(ready ? orH : na, "OR high", color.new(color.teal, 0), 2, plot.style_linebr)
+plot(ready ? orL : na, "OR low",  color.new(color.red, 0),  2, plot.style_linebr)
+bgcolor(inOR ? color.new(color.blue, 90) : na, title="opening range")
